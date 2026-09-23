@@ -1,0 +1,58 @@
+# Local development services for DibantuAI (Step 9 → Step 11: + PostgreSQL).
+# The GLM API key is supplied by the local .env file (never committed,
+# never baked into the image).
+#
+# Host port 8090 avoids conflicts with other local projects on 8000;
+# the app inside the container still listens on 8000.
+
+services:
+  dibantu-ai:
+    build: .
+    container_name: dibantu-ai
+    ports:
+      - "8090:8000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-dibantu}:${POSTGRES_PASSWORD:-dibantu_password}@postgres:5432/${POSTGRES_DB:-dibantu_ai}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      # slim image has no curl/wget; use Python's stdlib instead.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  postgres:
+    image: postgres:16
+    container_name: dibantu-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-dibantu_ai}
+      POSTGRES_USER: ${POSTGRES_USER:-dibantu}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dibantu_password}
+    ports:
+      # Host 5433: host 5432 is usually taken by other projects. Used
+      # for psql inspection, pytest, and host-run uvicorn sessions.
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dibantu} -d ${POSTGRES_DB:-dibantu_ai}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

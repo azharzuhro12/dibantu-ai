@@ -1,0 +1,42 @@
+# --- Environment / secrets (never commit) ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+coverage/
+htmlcov/
+
+# --- Node / Next.js (frontend has its own .gitignore too) ---
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+npm-debug.log*
+
+# --- Database artifacts (the real DB lives in the Docker volume) ---
+*.sql
+*.dump
+*.sqlite3
+*.db
+
+# --- Logs ---
+*.log
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# --- Local tool config ---
+.claude/settings.local.json

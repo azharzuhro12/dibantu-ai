@@ -1,0 +1,26 @@
+# Version control
+.git
+.gitignore
+
+# Secrets — never bake into the image
+.env
+.env.example
+
+# Python artifacts
+__pycache__
+*.pyc
+.pytest_cache
+
+# Virtual environment
+.venv
+
+# Dev-only files, not needed at runtime
+tests/
+evaluation/
+conftest.py
+.claude
+
+# Docker metadata itself
+Dockerfile
+.dockerignore
+docker-compose.yml
