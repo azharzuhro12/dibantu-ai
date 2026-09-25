@@ -1,4 +1,4 @@
-# DibantuAI Agent Evaluation (Step 6)
+# DibantuAI Agent Evaluation (Step 6 → Step 12)
 
 A lightweight, deterministic, offline evaluation framework for the
 DibantuAI agent. No LangChain/LangGraph, no external model API, no API
@@ -30,6 +30,13 @@ main business database behind `DATABASE_URL`/`.env` is never touched.
 The scratch server is the Docker Compose Postgres (start it with
 `docker compose up -d postgres`); when it is unreachable the evaluator
 exits with a clear message instead of resetting anything.
+
+Since Step 12, `knowledge_*` cases also run the **real**
+`search_knowledge_base` tool — against a scratch vector store the
+evaluator ingests into a temporary directory with deterministic
+`hashing` embeddings (no model download, no network; the developer's
+real `data/rag` store is never touched). The CLI report separates
+business cases (Step 6) from knowledge/RAG cases (Step 12).
 
 ## Checks per case (all must hold for a pass)
 

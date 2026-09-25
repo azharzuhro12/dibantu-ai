@@ -1,15 +1,18 @@
-"""Tool registry for DibantuAI (Step 4A).
+"""Tool registry for DibantuAI (Step 4A → Step 12: + knowledge base).
 
-Maps the Step 3 business tools to the Anthropic tool-use format so the
-chat agent can advertise them via ``get_tool_schemas()`` and dispatch
-calls via ``get_tool(name)``. ``reset_mock_data`` is a test helper and
-is intentionally not registered.
+Maps the business tools (and, since Step 12, the RAG knowledge tool) to
+the Anthropic tool-use format so the chat agent can advertise them via
+``get_tool_schemas()`` and dispatch calls via ``get_tool(name)``.
+``reset_mock_data`` is a test helper and is intentionally not
+registered.
 """
 
 from __future__ import annotations
 
 import copy
 from typing import Any, Callable
+
+from app.rag.knowledge_tool import search_knowledge_base
 
 from .business_tools import (
     VALID_PERIODS,
@@ -31,6 +34,7 @@ _TOOLS: dict[str, Callable[..., Any]] = {
     "search_customer": search_customer,
     "get_sales_report": get_sales_report,
     "get_low_stock": get_low_stock,
+    "search_knowledge_base": search_knowledge_base,
 }
 
 #: name -> Anthropic-compatible schema (``name`` / ``description`` /
@@ -162,6 +166,39 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
             },
             "required": ["threshold"],
+        },
+    },
+    "search_knowledge_base": {
+        "name": "search_knowledge_base",
+        "description": (
+            "Search the business knowledge base (documented policies, "
+            "procedures, and operational rules) and return the most "
+            "relevant passages with their source documents. Use this "
+            "for policy or procedure questions such as refunds, "
+            "cancellations, stock rules, payment rules, or operating "
+            "rules. Do NOT use it for live stock, orders, customers, or "
+            "sales data — those come from the database tools."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "The policy/procedure question or keywords to "
+                        "look up in the knowledge base."
+                    ),
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": (
+                        "Number of passages to return (1-10; default 3)."
+                    ),
+                    "minimum": 1,
+                    "maximum": 10,
+                },
+            },
+            "required": ["query"],
         },
     },
 }

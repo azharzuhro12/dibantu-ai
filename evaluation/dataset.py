@@ -17,6 +17,10 @@ Conventions that keep every case honest:
 - ``expected_state`` is checked through the public business tools after
   the run (product stocks and the 30-day order count; the seed has 4
   orders, so ``monthly_orders=5`` asserts an order was created).
+- knowledge_* cases (Step 12) run the real ``search_knowledge_base``
+  against a scratch vector store the evaluator ingests from
+  ``data/knowledge``; their grounding facts must appear in the reply AND
+  in the retrieved passages (or the source metadata the tool returns).
 
 Seed reference (restored before every case): Kopi Susu 24 @18000,
 Americano 40 @22000, Croissant 8 @25000, Matcha Latte 15 @24000,
@@ -35,12 +39,14 @@ __all__ = [
     "CATEGORIES",
     "EvalCase",
     "GLMTurn",
+    "RAG_CATEGORIES",
     "StateExpectation",
     "ToolCall",
     "load_cases",
 ]
 
-#: Every category used by the dataset (spec: Step 6).
+#: Every category used by the dataset (spec: Step 6; Step 12 adds the
+#: knowledge_* categories).
 CATEGORIES: tuple[str, ...] = (
     "stock_check",
     "order",
@@ -53,6 +59,17 @@ CATEGORIES: tuple[str, ...] = (
     "invalid_request",
     "tool_error",
     "multi_step",
+    "knowledge_rag",
+    "knowledge_hybrid",
+    "knowledge_unavailable",
+)
+
+#: Step 12 categories: cases that run against the RAG knowledge base
+#: (the evaluator prepares an isolated scratch vector store for them).
+RAG_CATEGORIES: tuple[str, ...] = (
+    "knowledge_rag",
+    "knowledge_hybrid",
+    "knowledge_unavailable",
 )
 
 
@@ -728,6 +745,100 @@ CASES: list[EvalCase] = [
         ),
         facts=("8", "28"),
         stock={"Croissant": 28},
+    ),
+    # --- knowledge_rag (Step 12: answers grounded in the knowledge base) ---
+    case(
+        "ev_101",
+        "knowledge_rag",
+        "Apa aturan refund untuk pesanan yang sudah dibayar?",
+        "Cari kebijakan refund di basis pengetahuan dan jawab dengan sitasi.",
+        ("search_knowledge_base",),
+        (1, 1),
+        (
+            tools(
+                (
+                    "search_knowledge_base",
+                    {"query": "aturan refund untuk pesanan yang sudah dibayar"},
+                )
+            ),
+            say(
+                "Menurut refund_policy.md (bagian Syarat Kelayakan Refund), "
+                "refund hanya diajukan untuk pesanan yang sudah dibayar dan "
+                "paling lambat 1x24 jam setelah pesanan dibuat.\n\n"
+                "Sumber: refund_policy.md — Syarat Kelayakan Refund."
+            ),
+        ),
+        facts=("refund_policy.md", "1x24 jam"),
+    ),
+    case(
+        "ev_102",
+        "knowledge_rag",
+        "Berapa ambang stok rendah standar dan apa yang harus dilakukan?",
+        "Kebijakan stok rendah dijawab dari knowledge base dengan sitasi.",
+        ("search_knowledge_base",),
+        (1, 1),
+        (
+            tools(
+                ("search_knowledge_base", {"query": "ambang stok rendah standar"})
+            ),
+            say(
+                "Menurut inventory_policy.md, ambang stok rendah standar "
+                "adalah 10 unit per produk; produk yang menyentuh ambang "
+                "itu wajib masuk daftar pembelian hari itu.\n\n"
+                "Sumber: inventory_policy.md — Kebijakan Stok Rendah."
+            ),
+        ),
+        facts=("inventory_policy.md", "10 unit"),
+    ),
+    # --- knowledge_hybrid (RAG + live PostgreSQL data in one turn) --------
+    case(
+        "ev_103",
+        "knowledge_hybrid",
+        "Apa aturan stok rendah dan berapa stok Kopi Susu sekarang?",
+        "Kebijakan dari knowledge base + stok aktual dari database, jelas dipisah.",
+        ("search_knowledge_base", "check_stock"),
+        (2, 2),
+        (
+            tools(
+                (
+                    "search_knowledge_base",
+                    {"query": "aturan ambang stok rendah"},
+                ),
+                ("check_stock", {"product_name": "Kopi Susu"}),
+            ),
+            say(
+                "Menurut inventory_policy.md, ambang stok rendah standar "
+                "adalah 10 unit per produk. Stok Kopi Susu saat ini "
+                "24 unit — masih di atas ambang.\n\n"
+                "Sumber: inventory_policy.md — Kebijakan Stok Rendah."
+            ),
+        ),
+        facts=("inventory_policy.md", "24"),
+        stock={"Kopi Susu": 24},
+    ),
+    # --- knowledge_unavailable (say so instead of inventing) --------------
+    case(
+        "ev_104",
+        "knowledge_unavailable",
+        "Apa kebijakan penggantian mesin kasir di cabang Bandung?",
+        "Cari dulu, lalu akui informasi tidak tersedia — jangan mengarang kebijakan.",
+        ("search_knowledge_base",),
+        (1, 1),
+        (
+            tools(
+                (
+                    "search_knowledge_base",
+                    {"query": "kebijakan penggantian mesin kasir cabang Bandung"},
+                )
+            ),
+            say(
+                "Maaf, kebijakan mengenai penggantian mesin kasir tidak "
+                "tersedia di basis pengetahuan."
+            ),
+        ),
+        # No grounding facts: the honest answer is about the ABSENCE of
+        # information, which by definition cannot appear in a tool result.
+        # The check that matters here is that the search actually ran.
     ),
 ]
 

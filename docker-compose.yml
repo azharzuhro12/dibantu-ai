@@ -15,6 +15,12 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-dibantu}:${POSTGRES_PASSWORD:-dibantu_password}@postgres:5432/${POSTGRES_DB:-dibantu_ai}
+      # RAG (Step 12): vector store + HuggingFace model cache live in the
+      # rag_data volume so embeddings survive rebuilds and restarts.
+      RAG_STORE_DIR: /app/data/rag/chroma
+      HF_HOME: /app/data/rag/hf_cache
+    volumes:
+      - rag_data:/app/data/rag
     depends_on:
       postgres:
         condition: service_healthy
@@ -56,3 +62,4 @@ services:
 
 volumes:
   postgres_data:
+  rag_data:

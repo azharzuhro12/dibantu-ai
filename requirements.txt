@@ -1,3 +1,8 @@
+# NOTE (RAG, Step 12): embeddings run locally with sentence-transformers.
+# Install CPU-only torch FIRST so pip never pulls the multi-GB CUDA build:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# (The Dockerfile already does this; see the README RAG section.)
+
 fastapi==0.141.1
 uvicorn==0.53.0
 python-dotenv==1.2.3
@@ -7,3 +12,7 @@ pytest==9.1.1
 sqlalchemy==2.0.43
 psycopg[binary]==3.2.10
 alembic==1.17.1
+
+# RAG knowledge base (Step 12): vector store + local embeddings.
+chromadb==1.5.9
+sentence-transformers==6.1.0

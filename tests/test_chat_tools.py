@@ -38,6 +38,7 @@ REGISTERED_TOOL_NAMES = [
     "search_customer",
     "get_sales_report",
     "get_low_stock",
+    "search_knowledge_base",
 ]
 
 

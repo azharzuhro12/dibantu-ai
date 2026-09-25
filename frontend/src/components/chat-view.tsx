@@ -34,6 +34,7 @@ const SUGGESTIONS = [
   "Cek stok kopi susu",
   "Laporan penjualan harian",
   "Produk apa saja yang stoknya rendah?",
+  "Apa aturan refund pesanan?",
   "Cari customer Budi",
 ];
 

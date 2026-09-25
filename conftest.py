@@ -52,3 +52,27 @@ def test_database():
     from app.db.database import dispose_engines
 
     dispose_engines()
+
+
+@pytest.fixture()
+def rag_service(tmp_path):
+    """Isolated, pre-ingested RAG stack for knowledge-base tests (Step 12).
+
+    Mirrors the scratch-database idea: the demo knowledge documents are
+    ingested with deterministic ``hashing`` embeddings into a per-test
+    temporary store — no model download, no network, and the real
+    ``data/rag`` directory is never touched — and the shared service
+    singleton is restored afterwards so later tests rebuild from
+    settings.
+    """
+    from app.rag.service import RagService, reset_rag_service, set_rag_service
+
+    service = RagService(
+        knowledge_dir=str(ROOT / "data" / "knowledge"),
+        store_dir=str(tmp_path / "chroma"),
+        embeddings_provider="hashing",
+    )
+    service.ingest()
+    set_rag_service(service)
+    yield service
+    reset_rag_service()

@@ -1,10 +1,12 @@
 """Additional API routes for DibantuAI (chat endpoint backed by the GLM
 tool-calling agent loop, Step 4; local WhatsApp webhook simulator, Step 7;
-human-in-the-loop approval endpoints, Step 8)."""
+human-in-the-loop approval endpoints, Step 8; knowledge-base endpoints,
+Step 12)."""
 
 from dataclasses import asdict
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 
 from app.agent.agent import DibantuAgent
 from app.agent.glm_client import GLMConfigError, GLMError
@@ -16,9 +18,13 @@ from app.models.schemas import (
     ApprovalResponse,
     ChatRequest,
     ChatResponse,
+    KnowledgeIngestResponse,
+    KnowledgeSearchResponse,
     WhatsAppWebhookRequest,
     WhatsAppWebhookResponse,
 )
+from app.rag.errors import RagError
+from app.rag.service import get_rag_service
 
 router = APIRouter()
 
@@ -136,3 +142,59 @@ async def reject_approval(approval_id: str) -> ApprovalResponse:
     except ApprovalNotPendingError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return ApprovalResponse(**asdict(approval))
+
+
+@router.post(
+    "/api/knowledge/ingest",
+    response_model=KnowledgeIngestResponse,
+    tags=["knowledge"],
+)
+async def ingest_knowledge() -> KnowledgeIngestResponse:
+    """(Re)ingest the configured knowledge directory into ChromaDB.
+
+    Deliberately takes no request body: ingestion is restricted to the
+    server-configured ``KNOWLEDGE_DIR`` — callers can never point it at
+    an arbitrary filesystem path. Idempotent; heavy work (embedding)
+    runs in a thread so the event loop is not blocked.
+    """
+    try:
+        report = await run_in_threadpool(get_rag_service().ingest)
+    except RagError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return KnowledgeIngestResponse(
+        documents_found=report.documents_found,
+        documents_created=report.documents_created,
+        documents_updated=report.documents_updated,
+        documents_skipped=report.documents_skipped,
+        chunks_created=report.chunks_created,
+        total_chunks=report.total_chunks,
+        knowledge_dir=get_rag_service().knowledge_dir,
+        store_dir=report.store_dir,
+    )
+
+
+@router.get(
+    "/api/knowledge/search",
+    response_model=KnowledgeSearchResponse,
+    tags=["knowledge"],
+)
+async def search_knowledge(
+    q: str = Query(..., min_length=1, description="Question or keywords to look up."),
+    top_k: int | None = Query(
+        None, ge=1, le=10, description="Passages to return (default 3)."
+    ),
+) -> KnowledgeSearchResponse:
+    """Search the knowledge base (retrieval only; no LLM involved).
+
+    The primary user-facing path stays POST /api/chat — this endpoint
+    exists for inspecting what the RAG tool would retrieve.
+    """
+    try:
+        result = await run_in_threadpool(
+            get_rag_service().search, q, top_k=top_k
+        )
+    except RagError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return KnowledgeSearchResponse(**result)

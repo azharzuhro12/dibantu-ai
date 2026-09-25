@@ -1,4 +1,4 @@
-"""Deterministic evaluator for the DibantuAI agent (Step 6).
+"""Deterministic evaluator for the DibantuAI agent (Step 6 → Step 12).
 
 Replays each dataset case through the real ``Agent`` loop driven by a
 ``ScriptedGLMClient`` (no network, no API key) while the real registry
@@ -17,6 +17,12 @@ checks five simple, explainable properties:
    AND in a tool result the agent actually received, so replies cannot
    cite data the tools never returned.
 
+Since Step 12, knowledge_* cases run the real ``search_knowledge_base``
+tool against an isolated scratch vector store (deterministic hashing
+embeddings, temporary directory) — mirroring the scratch-database
+isolation, the developer's real ``data/rag`` store is never touched and
+the run stays offline.
+
 Metrics are plain rates over these checks. There is deliberately no
 weighted overall score.
 """
@@ -24,13 +30,15 @@ weighted overall score.
 from __future__ import annotations
 
 import asyncio
+import shutil
+import tempfile
 from dataclasses import dataclass
 from typing import Any
 
 from app.agent.agent import Agent
 from app.agent.glm_client import GLMResponse, ToolUse
 from app.tools.business_tools import check_stock, get_sales_report, reset_mock_data
-from .dataset import EvalCase, GLMTurn, StateExpectation, load_cases
+from .dataset import RAG_CATEGORIES, EvalCase, GLMTurn, StateExpectation, load_cases
 
 __all__ = [
     "CaseResult",
@@ -255,6 +263,37 @@ def _run_case(case: EvalCase) -> CaseResult:
     )
 
 
+def _setup_scratch_rag_store() -> str:
+    """Ingest the knowledge docs into a throwaway vector store.
+
+    Deterministic hashing embeddings keep the run offline and free (no
+    model download); the temporary directory is returned so the caller
+    can remove it afterwards. Installed via ``set_rag_service`` so the
+    real ``search_knowledge_base`` tool resolves to this store.
+    """
+    from app.config import get_settings
+    from app.rag.service import RagService, set_rag_service
+
+    settings = get_settings()
+    scratch_dir = tempfile.mkdtemp(prefix="dibantu_rag_eval_")
+    service = RagService(
+        knowledge_dir=settings.knowledge_dir,
+        store_dir=scratch_dir,
+        embeddings_provider="hashing",
+    )
+    service.ingest()
+    set_rag_service(service)
+    return scratch_dir
+
+
+def _teardown_scratch_rag_store(scratch_dir: str) -> None:
+    """Restore settings-driven RAG construction and delete the scratch."""
+    from app.rag.service import reset_rag_service
+
+    reset_rag_service()
+    shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
 def _check_state(expected: StateExpectation) -> list[str]:
     """Compare the mock store against the expected final state."""
     failures: list[str] = []
@@ -278,9 +317,25 @@ def _check_state(expected: StateExpectation) -> list[str]:
 def run_evaluation(
     cases: list[EvalCase] | tuple[EvalCase, ...] | None = None,
 ) -> EvaluationReport:
-    """Evaluate every case (default: the full dataset) and aggregate."""
+    """Evaluate every case (default: the full dataset) and aggregate.
+
+    Knowledge_* cases need the RAG stack: before running them, a scratch
+    vector store (hashing embeddings, temporary directory) is ingested
+    from the configured knowledge directory and installed as the shared
+    service — the real ``data/rag`` store is never touched — and torn
+    down afterwards.
+    """
     evaluated = list(load_cases() if cases is None else cases)
-    results = tuple(run_case(case) for case in evaluated)
+    scratch_dir = (
+        _setup_scratch_rag_store()
+        if any(case.category in RAG_CATEGORIES for case in evaluated)
+        else None
+    )
+    try:
+        results = tuple(run_case(case) for case in evaluated)
+    finally:
+        if scratch_dir is not None:
+            _teardown_scratch_rag_store(scratch_dir)
     total = len(results)
 
     def percent(count: int) -> float:
@@ -307,11 +362,26 @@ def run_evaluation(
 
 
 def format_report(report: EvaluationReport) -> str:
-    """Render an EvaluationReport as the plain-text CLI report."""
+    """Render an EvaluationReport as the plain-text CLI report.
+
+    Business (Step 6) and knowledge/RAG (Step 12) cases are reported
+    separately in addition to the overall numbers, so RAG additions can
+    never silently shift the business-case picture.
+    """
     error_rate = (
         "n/a" if report.tool_error_handling_rate is None
         else f"{report.tool_error_handling_rate}%"
     )
+    business = [r for r in report.results if r.category not in RAG_CATEGORIES]
+    knowledge = [r for r in report.results if r.category in RAG_CATEGORIES]
+
+    def group_lines(name: str, results: list[CaseResult]) -> list[str]:
+        if not results:
+            return [f"{name}: 0 cases"]
+        passed = sum(1 for r in results if r.passed)
+        rate = round(100 * passed / len(results), 1)
+        return [f"{name}: {passed}/{len(results)} passed ({rate}%)"]
+
     lines = [
         "DibantuAI Agent Evaluation",
         "==========================",
@@ -319,6 +389,9 @@ def format_report(report: EvaluationReport) -> str:
         f"Passed: {report.passed}",
         f"Failed: {report.failed}",
         f"Pass Rate: {report.pass_rate}%",
+        "",
+        *group_lines("Business cases (Step 6)", business),
+        *group_lines("Knowledge/RAG cases (Step 12)", knowledge),
         "",
         f"Tool Selection Accuracy: {report.tool_selection_accuracy}%",
         f"Task Completion Rate: {report.task_completion_rate}%",
@@ -344,7 +417,9 @@ def main() -> None:
     Every case resets the store (``reset_mock_data()``), so the run is
     pinned to the isolated scratch database first — the main business
     database behind DATABASE_URL/.env is never touched (see
-    ``evaluation/db_isolation.py``).
+    ``evaluation/db_isolation.py``). Knowledge cases likewise run
+    against a throwaway vector store (hashing embeddings), never the
+    developer's real ``data/rag``.
     """
     from .db_isolation import ScratchDatabaseUnavailable, database_name, ensure_scratch_database
 
@@ -353,6 +428,7 @@ def main() -> None:
     except ScratchDatabaseUnavailable as exc:
         raise SystemExit(f"Cannot evaluate: {exc}") from exc
     print(f"Scratch database: {database_name(url)} (main business DB untouched)")
+    print("RAG scratch store: temporary (hashing embeddings, real data/rag untouched)")
     print(format_report(run_evaluation()))
 
 

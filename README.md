@@ -7,18 +7,20 @@ Masalah yang dipecahkan: pemilik usaha kecil tidak butuh aplikasi kasir kompleks
 ## Fitur Utama
 
 - **Chat agent dengan tool calling** — agent memanggil business tools (stok, order, customer, laporan) lewat loop GLM; tidak pernah mengarang data bisnis.
+- **RAG knowledge base (Step 12)** — agent menjawab pertanyaan kebijakan/prosedur (refund, stok, order) dari dokumen basis pengetahuan lokal (ChromaDB + embeddings lokal), lengkap dengan sitasi sumber; data bisnis live tetap di PostgreSQL dan keduanya tidak pernah tertukar.
 - **PostgreSQL persistence** — data bisnis tersimpan di Postgres (SQLAlchemy + Alembic migration); restart container tidak menghilangkan data.
 - **Human-in-the-loop approval** — aksi sensitif (refund, cancel order, bulk stock update) tidak dieksekusi agent; menunggu persetujuan manusia lewat API/frontend.
 - **WhatsApp webhook simulator** — endpoint webhook ber-format WhatsApp untuk pengujian lokal (bukan integrasi Meta sungguhan).
 - **Dashboard Next.js** — halaman chat, inventory, orders, reports, dan approvals.
-- **Evaluation suite deterministik** — 34 skenario offline yang memverifikasi tool selection, task completion, error handling, dan grounding jawaban.
+- **Evaluation suite deterministik** — 38 skenario offline yang memverifikasi tool selection, task completion, error handling, dan grounding jawaban (34 bisnis + 4 RAG).
 
 ## Arsitektur & Alur Agent
 
 ```
 Pesan user → FastAPI /api/chat → Agent loop
   → GLM (endpoint Anthropic-compatible z.ai, model glm-5.3)
-  → tool_use → registry → business tools → PostgreSQL
+  → tool_use → registry ─┬→ business tools → PostgreSQL   (data live)
+  │                       └→ search_knowledge_base → ChromaDB (kebijakan)
   → tool_result → GLM → jawaban final
 ```
 
@@ -35,6 +37,7 @@ Pesan user → FastAPI /api/chat → Agent loop
 | Backend | FastAPI + Uvicorn + Pydantic |
 | LLM | GLM API (endpoint Anthropic-compatible z.ai, model `glm-5.3`) — custom agent loop, tanpa LangChain/LangGraph |
 | Database | PostgreSQL 16 + SQLAlchemy 2 + Alembic |
+| RAG | ChromaDB (vector store) + sentence-transformers `all-MiniLM-L6-v2` (embeddings lokal) — pipeline retrieval custom |
 | Frontend | Next.js (App Router) + TypeScript + Tailwind CSS |
 | Infra | Docker / Docker Compose |
 | Testing | pytest + evaluation suite deterministik |
@@ -53,6 +56,13 @@ docker compose up -d --build
 - **PostgreSQL:** host port 5433 → container 5432. Port ini hanya untuk inspeksi lokal (`psql`), pytest, dan uvicorn host — bukan untuk diexpose publik.
 - Saat start, container otomatis menjalankan `alembic upgrade head` lalu seed data bisnis (idempotent — restart tidak pernah menduplikasi baris atau menimpa order nyata).
 - API key hanya masuk lewat `env_file` saat runtime — tidak pernah di-bake ke image (`.env` ada di `.dockerignore` dan `.gitignore`).
+- Basis pengetahuan RAG perlu di-ingest sekali setelah build (downloads model embedding saat pertama kali, lalu disimpan di volume):
+
+```bash
+docker compose exec dibantu-ai python -m app.rag.ingest
+```
+
+- Vector store ChromaDB + cache model HuggingFace tersimpan di named volume `rag_data` — rebuild/restart tidak menghilangkannya, dan artefak embeddings tidak pernah masuk git/image.
 
 ## Menjalankan Frontend
 
@@ -82,12 +92,15 @@ cp frontend/.env.local.example frontend/.env.local
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
+# torch CPU dulu supaya pip tidak menarik build CUDA (multi-GB)
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
 
 cp .env.example .env          # isi GLM_API_KEY + DATABASE_URL (localhost:5433)
 docker compose up -d postgres # Postgres tetap via compose
 
 uvicorn app.main:app --reload --port 8090
+python -m app.rag.ingest      # ingest knowledge base (sekali; download model pertama kali)
 ```
 
 ## Environment Variables
@@ -99,6 +112,11 @@ uvicorn app.main:app --reload --port 8090
 | `GLM_MODEL` | Tidak | Default: `glm-5.3`. |
 | `DATABASE_URL` | Ya (tanpa compose) | `postgresql+psycopg://...`. Di dalam compose diisi otomatis; untuk uvicorn host: `...@localhost:5433/dibantu_ai`. |
 | `CORS_ALLOW_ORIGINS` | Tidak | Origin browser yang boleh memanggil API. Default: localhost/127.0.0.1 × 3000/3002. |
+| `KNOWLEDGE_DIR` | Tidak | Direktori dokumen Markdown knowledge base. Default: `data/knowledge`. |
+| `RAG_STORE_DIR` | Tidak | Direktori vector store ChromaDB. Default: `data/rag/chroma` (di compose: `/app/data/rag/chroma`). |
+| `RAG_EMBEDDINGS` | Tidak | `local` (sentence-transformers, default) atau `hashing` (deterministik offline — untuk test/eval). |
+| `RAG_EMBEDDING_MODEL` | Tidak | Default: `sentence-transformers/all-MiniLM-L6-v2`. |
+| `RAG_TOP_K` | Tidak | Jumlah passage per query. Default: `3`. |
 
 > **Keamanan:** jangan pernah menulis API key asli ke file yang di-commit. Gunakan `.env` (di-ignore `.gitignore` dan `.dockerignore`).
 
@@ -113,6 +131,8 @@ uvicorn app.main:app --reload --port 8090
 | GET | `/api/approvals` | Daftar approval pending. |
 | POST | `/api/approvals/{id}/approve` | Setujui approval. |
 | POST | `/api/approvals/{id}/reject` | Tolak approval. |
+| GET | `/api/knowledge/search?q=...` | Cari passage di knowledge base (retrieval saja, tanpa LLM). |
+| POST | `/api/knowledge/ingest` | (Re)ingest dokumen knowledge base (idempotent; tanpa parameter path — selalu direktori terkonfigurasi). |
 
 ## Database
 
@@ -129,17 +149,59 @@ with session_scope() as s: reset_database(s)"
 
 Keamanan transaksi: `create_order` mengunci baris produk (`FOR UPDATE`), memvalidasi stok kumulatif, lalu menulis order + item + potongan stok + agregat customer dalam **satu transaksi** — stok kurang berarti tidak ada order yang tersimpan.
 
+## RAG / Knowledge Base (Step 12)
+
+**Kenapa RAG?** Data bisnis live (stok, order, customer) dan pengetahuan bisnis (kebijakan, prosedur, aturan) adalah dua dunia berbeda. Stok bisa di-query dari database, tapi "berapa lama batas waktu refund?" adalah pertanyaan dokumen. RAG membuat agent menjawab pertanyaan kebijakan dari **dokumen resmi** dengan sitasi sumber — bukan dari ingatan model (yang bisa mengarang), dan tetap memakai tools database untuk angka live.
+
+**Alur retrieval:**
+
+```
+pertanyaan kebijakan
+  → agent memanggil tool search_knowledge_base(query)
+  → query di-embed (sentence-transformers, lokal)
+  → ChromaDB cosine similarity search → top-k passage
+  → passage + metadata (source, section, similarity) kembali ke GLM
+  → GLM menjawab HANYA dari passage tersebut + sitasi sumber
+```
+
+Komponen (semuanya lokal & gratis, tanpa API embedding berbayar, tanpa LangChain/LangGraph):
+
+| Tahap | Implementasi |
+| --- | --- |
+| Dokumen | Markdown di `data/knowledge/` — 4 dokumen kebijakan demo |
+| Chunking | Deterministik, sadar-heading Markdown: split per section `#`/`##`, pack paragraf ≤ 800 karakter, overlap 150 karakter |
+| Embeddings | `all-MiniLM-L6-v2` via sentence-transformers (384-dim, on-device; alternatif `hashing` untuk test offline) |
+| Vector store | ChromaDB persistent, collection tunggal, cosine space |
+| Retrieval | top-k (default 3, 1–10) passage + metadata source/section/chunk_id/similarity |
+| Agent | Tool `search_knowledge_base` di registry yang sama dengan business tools |
+
+**Ingestion (idempotent):**
+
+```bash
+python -m app.rag.ingest           # host; di Docker: docker compose exec dibantu-ai python -m app.rag.ingest
+# atau: POST /api/knowledge/ingest
+```
+
+Setiap dokumen di-hash; dokumen yang tidak berubah di-skip, dokumen berubah diganti seluruh chunk-nya (tidak ada duplikat/chunk basi). Output: jumlah dokumen dibuat/di-update/di-skip, chunk dibuat, total chunk, lokasi store.
+
+**Grounding & pemisahan sumber data.** System prompt agent memisahkan tiga kasus secara eksplisit: (1) data bisnis → tools PostgreSQL; (2) kebijakan/prosedur → `search_knowledge_base` dan jawab hanya dari passage ber-sitasi (mis. "Menurut refund_policy.md, ..."); (3) informasi yang tidak ada di knowledge base → katakan tidak tersedia, jangan pernah mengarang kebijakan atau sitasi. Pertanyaan campuran (kebijakan + stok) dieksekusi kedua tool dalam satu turn dan jawabannya diberi label jelas.
+
+**Catatan keamanan:** ingestion selalu terbatas pada direktori `KNOWLEDGE_DIR` yang dikonfigurasi di server — endpoint ingest tidak menerima path dari user. Artefak vector store (`data/rag/`) dan cache model HuggingFace di-ignore dari git dan tidak di-bake ke image (mereka hidup di volume `rag_data`).
+
+> Dokumen di `data/knowledge/` adalah **kebijakan bisnis demo/contoh** untuk portfolio — bukan kebijakan perusahaan nyata. Menambah dokumen baru: taruh file `.md` di `data/knowledge/`, jalankan ulang ingestion.
+
 ## Testing & Evaluation
 
 ```bash
 docker compose up -d postgres   # test database butuh Postgres
 source .venv/bin/activate
-pytest -q                       # 165 test
-python -m evaluation.evaluator  # 34 skenario
+pytest -q                       # 218 test
+python -m evaluation.evaluator  # 38 skenario
 ```
 
 - Test bisnis/DB berjalan di **database scratch terpisah** (`dibantu_ai_test`, dibuat & di-drop otomatis) — tidak pernah menyentuh data bisnis utama. Tanpa Postgres, test DB di-skip dengan alasan eksplisit.
-- Evaluation **deterministik dan offline** (client script, tanpa API key): 34 skenario, 100% pass rate — memverifikasi tool selection, jumlah tool call, task completion, error handling, dan grounding jawaban. Ini bukan klaim akurasi model.
+- Test & evaluasi RAG memakai **embeddings `hashing` deterministik + vector store scratch di tmp** — tanpa download model, tanpa network, dan `data/rag` milik developer tidak pernah disentuh (test model lokal men-skip dirinya jika model tak bisa di-download).
+- Evaluation **deterministik dan offline** (client script, tanpa API key): 38 skenario (34 bisnis + 4 RAG), 100% pass rate — memverifikasi tool selection, jumlah tool call, task completion, error handling, dan grounding jawaban. Laporan evaluasi memisahkan angka bisnis vs RAG. Ini bukan klaim akurasi model.
 
 ## Struktur Project
 
@@ -147,22 +209,28 @@ python -m evaluation.evaluator  # 34 skenario
 dibantu-ai/
 ├── app/
 │   ├── agent/          # Agent loop + GLM client
-│   ├── api/            # Routes (chat, webhook, approvals)
+│   ├── api/            # Routes (chat, webhook, approvals, knowledge)
 │   ├── approval/       # Human-in-the-loop approval store
 │   ├── db/             # Engine/session, models, repository, seed
 │   ├── models/         # Schema Pydantic
+│   ├── rag/            # RAG: chunker, embeddings, vector store, retriever, service, tool, CLI
 │   └── tools/          # Business tools + registry
 ├── alembic/            # Migration database
+├── data/
+│   ├── knowledge/      # Dokumen kebijakan Markdown (demo)
+│   └── rag/            # Vector store + cache model (generated, di-gitignore)
 ├── docker/             # entrypoint.sh (migrate + seed + uvicorn)
 ├── evaluation/         # Dataset + evaluator deterministik
 ├── frontend/           # Dashboard Next.js
-├── tests/              # 165 test pytest
+├── tests/              # 218 test pytest
 ├── docker-compose.yml
 └── Dockerfile
 ```
 
 ## Status & Limitations
 
-🚧 **Step 11: PostgreSQL persistence — selesai.** Backend lengkap (agent + tool calling + approval + webhook simulator + 165 test), evaluation 34/34, dashboard Next.js, dan data bisnis tersimpan di PostgreSQL.
+🚧 **Step 12: RAG / Knowledge Base — selesai.** Seluruh Step 1–11 (agent + tool calling + approval + webhook simulator + PostgreSQL persistence) tetap utuh, ditambah knowledge base lokal: retrieval ChromaDB + embeddings lokal, tool `search_knowledge_base` di agent, endpoint knowledge API, ingestion idempotent, 218 test, dan evaluasi 38/38.
 
 Belum diimplementasikan: WhatsApp Cloud API sungguhan (Meta auth + verifikasi signature), tunnel ngrok, integrasi Google Sheets, autentikasi, dan deployment. Approval store masih in-memory (single-process MVP). Endpoint inventory/orders/reports khusus belum ada — halaman frontend terkait masih lewat assistant.
+
+Limitasi RAG saat ini: tidak ada UI manajemen dokumen (tambah/ubah dokumen = edit file + re-ingest); dokumen yang dihapus dari `data/knowledge/` tidak otomatis menghapus chunk lama di store (re-ingest dokumen berubah sudah ditangani); belum ada re-ranking maupun filter similarity threshold (relevansi dinilai GLM dari passage yang kembali); embedding model default berbahasa Inggris — dokumen Indonesia tetap ter-retrieve dengan baik lewat overlap kosakata, tapi model multibahasa (mis. `paraphrase-multilingual-MiniLM`) bisa lebih akurat dan tinggal ganti `RAG_EMBEDDING_MODEL` + hapus `data/rag/` + re-ingest.

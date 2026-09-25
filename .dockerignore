@@ -20,6 +20,10 @@ evaluation/
 conftest.py
 .claude
 
+# Generated RAG artifacts — the vector store lives in the rag_data
+# volume; only the source knowledge documents are baked into the image.
+data/rag
+
 # Docker metadata itself
 Dockerfile
 .dockerignore

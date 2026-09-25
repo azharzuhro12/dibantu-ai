@@ -27,6 +27,12 @@ npm-debug.log*
 *.sqlite3
 *.db
 
+# --- RAG vector-store artifacts (generated; rebuild: python -m app.rag.ingest) ---
+data/rag/
+
+# --- HuggingFace model cache (downloaded at runtime, never committed) ---
+hf_cache/
+
 # --- Logs ---
 *.log
 

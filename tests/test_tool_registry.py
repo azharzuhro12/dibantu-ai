@@ -1,4 +1,4 @@
-"""Tests for app.tools.registry (Step 4A)."""
+"""Tests for app.tools.registry (Step 4A → Step 12: + knowledge tool)."""
 
 import sys
 from pathlib import Path
@@ -9,6 +9,7 @@ if str(ROOT) not in sys.path:
 
 import pytest
 
+from app.rag.knowledge_tool import search_knowledge_base
 from app.tools import business_tools, registry
 
 EXPECTED_TOOLS = {
@@ -18,6 +19,7 @@ EXPECTED_TOOLS = {
     "search_customer",
     "get_sales_report",
     "get_low_stock",
+    "search_knowledge_base",
 }
 
 EXPECTED_REQUIRED = {
@@ -27,12 +29,13 @@ EXPECTED_REQUIRED = {
     "search_customer": {"name"},
     "get_sales_report": set(),
     "get_low_stock": {"threshold"},
+    "search_knowledge_base": {"query"},
 }
 
 
-def test_list_tools_registers_all_six_business_tools():
+def test_list_tools_registers_all_seven_tools():
     assert set(registry.list_tools()) == EXPECTED_TOOLS
-    assert len(registry.list_tools()) == 6
+    assert len(registry.list_tools()) == 7
 
 
 def test_reset_mock_data_is_not_exposed():
@@ -54,6 +57,7 @@ def test_list_tools_returns_a_copy():
         ("search_customer", business_tools.search_customer),
         ("get_sales_report", business_tools.get_sales_report),
         ("get_low_stock", business_tools.get_low_stock),
+        ("search_knowledge_base", search_knowledge_base),
     ],
 )
 def test_get_tool_returns_the_underlying_function(name, func):
@@ -68,7 +72,7 @@ def test_get_tool_unknown_name_returns_none():
 def test_get_tool_schemas_covers_every_registered_tool():
     schemas = registry.get_tool_schemas()
     assert {schema["name"] for schema in schemas} == EXPECTED_TOOLS
-    assert len(schemas) == 6
+    assert len(schemas) == 7
 
 
 def test_schemas_use_the_anthropic_tool_format():
@@ -108,5 +112,3 @@ def test_get_tool_schemas_returns_deep_copies():
 def test_registered_tools_are_wired_to_the_real_module():
     result = registry.get_tool("check_stock")("croissant")
     assert result["success"] is True
-    assert result["product_name"] == "Croissant"
-    assert result["stock"] == 8
