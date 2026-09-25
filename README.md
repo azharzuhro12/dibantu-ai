@@ -112,7 +112,8 @@ cp frontend/.env.local.example frontend/.env.local
 | Halaman | Data |
 | --- | --- |
 | **Chat** | `POST /api/chat` — loading, error, dan retry per pesan; badge status koneksi backend. |
-| **Inventory / Orders / Reports** | Lewat assistant (`/api/chat`); placeholder untuk endpoint khusus masa depan. |
+| **Inventory** | `GET /api/inventory` — tabel stok live dari PostgreSQL (loading/empty/error state + refresh); aksi tetap lewat assistant. |
+| **Orders / Reports** | Lewat assistant (`/api/chat`); placeholder untuk endpoint khusus masa depan. |
 | **Approvals** | Lifecycle penuh: `GET /api/approvals?status=all`, approve/reject, tombol **Execute** (Step 16), badge 6 status, panel hasil/error eksekusi, penanganan 404/409 + polling 30 detik. |
 | **Memory** (Step 14) | `GET/DELETE /api/memory` per owner — daftar, hapus, ganti owner. |
 | **Observability** (Step 15) | `GET /api/observability/runs` + timeline event per run, filter status. |
@@ -183,6 +184,7 @@ Semua alur di atas juga tersedia dari halaman **Approvals** di frontend (approve
 | GET | `/health` | Health check / liveness probe. |
 | GET | `/docs` | Swagger UI (OpenAPI). |
 | POST | `/api/chat` | Chat dengan agent (tool calling; `owner_key` opsional di body untuk memori per-owner, default `"default"`). |
+| GET | `/api/inventory` | Daftar semua produk read-only (nama, harga, stok, status stok) — sumber data sama dengan tool `check_stock`; tanpa LLM. |
 | POST | `/webhook/whatsapp` | Simulator webhook WhatsApp (lokal, tanpa Meta). |
 | GET | `/api/approvals` | Daftar approval (default: pending; `?status=approved\|rejected\|executing\|executed\|failed\|all` untuk lifecycle penuh). |
 | POST | `/api/approvals/{id}/approve` | Setujui approval (opsional `?reason=...`, maks 500 karakter) — hanya mencatat keputusan. |
@@ -410,6 +412,6 @@ dibantu-ai/
 | 15 | Observability end-to-end (`run_id` stabil, metadata aman by construction) |
 | 16 | Deferred approval execution (allowlist executor, claim atomik, idempoten, refund penuh/parsial) |
 
-Belum diimplementasikan (backlog yang disengaja): WhatsApp Cloud API sungguhan (Meta auth + verifikasi signature), tunnel ngrok, integrasi Google Sheets, autentikasi, dan deployment. Endpoint inventory/orders/reports khusus belum ada — halaman frontend terkait masih lewat assistant.
+Belum diimplementasikan (backlog yang disengaja): WhatsApp Cloud API sungguhan (Meta auth + verifikasi signature), tunnel ngrok, integrasi Google Sheets, autentikasi, dan deployment. Endpoint orders/reports khusus belum ada — halaman frontend terkait masih lewat assistant (inventory sudah punya endpoint read-only sendiri).
 
 Limitasi per fitur (jujur dan lengkap) didokumentasikan di masing-masing section di atas. Limitasi RAG: tidak ada UI manajemen dokumen (tambah/ubah dokumen = edit file + re-ingest); dokumen yang dihapus dari `data/knowledge/` tidak otomatis menghapus chunk lama di store (re-ingest dokumen berubah sudah ditangani); belum ada re-ranking maupun filter similarity threshold (relevansi dinilai GLM dari passage yang kembali); embedding model default berbahasa Inggris — dokumen Indonesia tetap ter-retrieve dengan baik lewat overlap kosakata, tapi model multibahasa (mis. `paraphrase-multilingual-MiniLM`) bisa lebih akurat dan tinggal ganti `RAG_EMBEDDING_MODEL` + hapus `data/rag/` + re-ingest.

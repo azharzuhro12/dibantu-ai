@@ -19,6 +19,8 @@ from app.approval.executor import (
     ApprovalNotExecutableError,
     execute_approval,
 )
+from app.db import database, repository
+from app.db.models import money
 from app.memory import (
     DEFAULT_OWNER_KEY,
     MemoryNotFoundError,
@@ -37,6 +39,8 @@ from app.models.schemas import (
     ApprovalResponse,
     ChatRequest,
     ChatResponse,
+    InventoryItemResponse,
+    InventoryListResponse,
     KnowledgeIngestResponse,
     KnowledgeSearchResponse,
     MemoryCreateRequest,
@@ -542,3 +546,41 @@ async def search_knowledge(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return KnowledgeSearchResponse(**result)
+
+
+@router.get(
+    "/api/inventory",
+    response_model=InventoryListResponse,
+    tags=["inventory"],
+)
+async def get_inventory() -> InventoryListResponse:
+    """Read-only product inventory for the dashboard table.
+
+    Lists every product straight from PostgreSQL through the shared
+    repository — the same source of truth the ``check_stock`` tool
+    reads — with the same per-product fields ``check_stock`` computes
+    (price, in-stock, low-stock against the product's own threshold).
+    No LLM, no tool calling; read-only.
+    """
+    try:
+        with database.session_scope() as session:
+            products = repository.list_products(session)
+    except SQLAlchemyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Inventory is unavailable (database error).",
+        ) from exc
+    return InventoryListResponse(
+        products=[
+            InventoryItemResponse(
+                name=product.name,
+                price=money(product.price),
+                stock=product.stock_quantity,
+                low_stock_threshold=product.low_stock_threshold,
+                in_stock=product.stock_quantity > 0,
+                low_stock=0 < product.stock_quantity <= product.low_stock_threshold,
+            )
+            for product in products
+        ],
+        count=len(products),
+    )

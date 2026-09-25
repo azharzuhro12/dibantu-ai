@@ -302,3 +302,32 @@ class KnowledgeIngestResponse(BaseModel):
     total_chunks: int = Field(..., description="Chunks now in the vector store.")
     knowledge_dir: str = Field(..., description="Knowledge directory that was ingested.")
     store_dir: str = Field(..., description="Vector store directory.")
+
+
+class InventoryItemResponse(BaseModel):
+    """One product row for GET /api/inventory.
+
+    Field semantics mirror the ``check_stock`` tool exactly (same
+    source of truth, same low-stock definition), so the inventory
+    table and the chat answer can never disagree.
+    """
+
+    name: str = Field(..., description="Product name.")
+    price: int | float = Field(..., description="Unit price (IDR, whole number).")
+    stock: int = Field(..., description="Current stock quantity.")
+    low_stock_threshold: int = Field(
+        ..., description="Stock level at/below which the product counts as low."
+    )
+    in_stock: bool = Field(..., description="Whether stock > 0.")
+    low_stock: bool = Field(
+        ..., description="Whether 0 < stock <= low_stock_threshold."
+    )
+
+
+class InventoryListResponse(BaseModel):
+    """Response payload for GET /api/inventory (read-only)."""
+
+    products: list[InventoryItemResponse] = Field(
+        default_factory=list, description="Every product, in catalog order."
+    )
+    count: int = Field(..., description="Number of products returned.")

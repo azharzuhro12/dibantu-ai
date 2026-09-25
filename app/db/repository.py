@@ -27,6 +27,11 @@ def list_product_names(session: Session) -> list[str]:
     return list(session.scalars(select(Product.name).order_by(Product.id)))
 
 
+def list_products(session: Session) -> list[Product]:
+    """All products in catalog (seed) order — read-only listing."""
+    return list(session.scalars(select(Product).order_by(Product.id)))
+
+
 def find_product(session: Session, name: str) -> Product | None:
     """Return the product matching ``name`` case-insensitively, or None."""
     wanted = name.strip().casefold()

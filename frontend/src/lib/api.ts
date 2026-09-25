@@ -8,6 +8,7 @@
  * Backend endpoints used (and nothing else — no endpoint is invented):
  *   GET  /health
  *   POST /api/chat
+ *   GET  /api/inventory
  *   GET  /api/approvals
  *   POST /api/approvals/{id}/approve
  *   POST /api/approvals/{id}/reject
@@ -219,6 +220,31 @@ export function sendMessage(message: string): Promise<ChatResponse> {
 /** GET /health — liveness probe, also used for the connection badge. */
 export function checkHealth(): Promise<HealthResponse> {
   return request<HealthResponse>("/health");
+}
+
+/** One product row from GET /api/inventory (read-only PostgreSQL data). */
+export interface InventoryProduct {
+  name: string;
+  price: number;
+  stock: number;
+  low_stock_threshold: number;
+  in_stock: boolean;
+  low_stock: boolean;
+}
+
+export interface InventoryListResponse {
+  products: InventoryProduct[];
+  count: number;
+}
+
+/**
+ * GET /api/inventory — every product straight from PostgreSQL, the
+ * same source of truth the check_stock tool reads. Field semantics
+ * (in_stock / low_stock) match the tool, so the table and a chat
+ * answer can never disagree.
+ */
+export function getInventory(): Promise<InventoryListResponse> {
+  return request<InventoryListResponse>("/api/inventory");
 }
 
 /** Statuses GET /api/approvals?status= accepts ("all" = every approval). */

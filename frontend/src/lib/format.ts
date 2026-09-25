@@ -34,3 +34,8 @@ export function humanizeAction(action: string): string {
     .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
     .join(" ");
 }
+
+/** Format an IDR amount, e.g. 18000 -> "Rp18.000". */
+export function formatRupiah(amount: number): string {
+  return `Rp${new Intl.NumberFormat("id-ID").format(amount)}`;
+}
