@@ -49,7 +49,9 @@ def post_chat(agent: DibantuAgent, message: str) -> httpx.Response:
 def test_chat_returns_mocked_reply() -> None:
     response = post_chat(mock_agent(), "Halo, siapa kamu?")
     assert response.status_code == 200
-    assert response.json() == {"response": "Halo! Saya DibantuAI."}
+    body = response.json()
+    assert body["response"] == "Halo! Saya DibantuAI."
+    assert body["run_id"].startswith("run-")  # Step 15 tracing id
 
 
 def test_chat_unconfigured_returns_503() -> None:

@@ -133,6 +133,14 @@ export function IconSparkles(props: IconProps) {
   );
 }
 
+export function IconPulse(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M3 12h4l2.5-7 4 14 2.5-7h5" />
+    </Svg>
+  );
+}
+
 export function IconAlert(props: IconProps) {
   return (
     <Svg {...props}>

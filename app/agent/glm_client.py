@@ -68,7 +68,9 @@ class GLMResponse:
     (Step 5) lists every requested tool call in order so multi-product
     requests can be answered in a single turn. ``stop_reason`` mirrors
     the API field (typically ``"end_turn"`` for plain text and
-    ``"tool_use"`` for tool calls).
+    ``"tool_use"`` for tool calls). ``usage`` (Step 15) carries the
+    provider-reported token counts when present — ``None`` otherwise
+    (counts are never invented); it feeds observability only.
     """
 
     text: str | None
@@ -76,6 +78,7 @@ class GLMResponse:
     tool_input: dict[str, Any] | None = None
     stop_reason: str | None = None
     tool_uses: tuple[ToolUse, ...] = ()
+    usage: dict[str, int] | None = None
 
 
 class GLMClient:
@@ -206,9 +209,10 @@ def _parse_response(data: Any) -> GLMResponse:
 
     Extracts the concatenated ``text`` blocks, every ``tool_use`` block
     (``tool_uses``, in order — the first also fills ``tool_name``/
-    ``tool_input`` for single-call callers), and the top-level
-    ``stop_reason``. Raises GLMAPIError on malformed payloads or when
-    the response contains neither text nor tool_use content.
+    ``tool_input`` for single-call callers), the top-level
+    ``stop_reason``, and the provider-reported token ``usage`` when
+    present. Raises GLMAPIError on malformed payloads or when the
+    response contains neither text nor tool_use content.
     """
     try:
         blocks = data["content"]
@@ -239,4 +243,17 @@ def _parse_response(data: Any) -> GLMResponse:
         tool_input=tool_input,
         stop_reason=stop_reason,
         tool_uses=tool_uses,
+        usage=_parse_usage(data.get("usage")),
     )
+
+
+def _parse_usage(usage: Any) -> dict[str, int] | None:
+    """Keep only integer token counts the provider actually returned."""
+    if not isinstance(usage, dict):
+        return None
+    parsed = {
+        key: usage[key]
+        for key in ("input_tokens", "output_tokens")
+        if isinstance(usage.get(key), int)
+    }
+    return parsed or None

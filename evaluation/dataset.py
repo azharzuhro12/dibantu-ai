@@ -35,11 +35,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 __all__ = [
+    "APPROVAL_CATEGORIES",
     "CASES",
     "CATEGORIES",
     "EvalCase",
     "GLMTurn",
+    "MEMORY_CATEGORIES",
+    "OBSERVABILITY_CATEGORIES",
     "RAG_CATEGORIES",
+    "ApprovalFlow",
     "StateExpectation",
     "ToolCall",
     "load_cases",
@@ -62,6 +66,16 @@ CATEGORIES: tuple[str, ...] = (
     "knowledge_rag",
     "knowledge_hybrid",
     "knowledge_unavailable",
+    "memory_save",
+    "memory_recall",
+    "memory_hybrid",
+    "memory_isolation",
+    "approval_lifecycle",
+    "approval_rejection",
+    "approval_concurrency",
+    "approval_invalid",
+    "approval_failure",
+    "observability_trace",
 )
 
 #: Step 12 categories: cases that run against the RAG knowledge base
@@ -70,6 +84,30 @@ RAG_CATEGORIES: tuple[str, ...] = (
     "knowledge_rag",
     "knowledge_hybrid",
     "knowledge_unavailable",
+)
+
+#: Step 14 categories: cases that exercise the persistent memory tools.
+MEMORY_CATEGORIES: tuple[str, ...] = (
+    "memory_save",
+    "memory_recall",
+    "memory_hybrid",
+    "memory_isolation",
+)
+
+#: Step 16 categories: cases that exercise the approval lifecycle and
+#: the executor (decisions, execution, conflicts, failures, persistence).
+APPROVAL_CATEGORIES: tuple[str, ...] = (
+    "approval_lifecycle",
+    "approval_rejection",
+    "approval_concurrency",
+    "approval_invalid",
+    "approval_failure",
+)
+
+#: Step 15/16 categories: cases that verify the observability contract
+#: of approval executions (trace events, safe metadata).
+OBSERVABILITY_CATEGORIES: tuple[str, ...] = (
+    "observability_trace",
 )
 
 
@@ -104,6 +142,33 @@ class StateExpectation:
 
 
 @dataclass(frozen=True)
+class ApprovalFlow:
+    """Scripted approval lifecycle applied AFTER the agent run (Step 16).
+
+    The agent turn creates (or, with ``expect_created=False``, must not
+    create) a pending approval; ``steps`` then drive the human side
+    deterministically through the real manager/executor against the
+    scratch database:
+
+    * ``approve``            -- approve it, expecting ``approved``
+    * ``reject``             -- reject it, expecting ``rejected``
+    * ``execute``            -- execute it, expecting ``executed`` or
+                                ``failed`` (per ``final_status``)
+    * ``execute_conflict``   -- a duplicate execute must raise a
+                                conflict and change nothing
+    * ``verify_persisted``   -- dispose engines (a simulated restart)
+                                and re-read the terminal state
+    """
+
+    action: str
+    expect_created: bool = True
+    steps: tuple[str, ...] = ()
+    final_status: str = "pending"
+    expect_result_success: bool | None = None
+    expect_trace_event: str | None = None
+
+
+@dataclass(frozen=True)
 class EvalCase:
     """One evaluation case: request + scripted trajectory + expectations."""
 
@@ -117,6 +182,11 @@ class EvalCase:
     grounding_facts: tuple[str, ...] = ()
     expected_state: StateExpectation = field(default_factory=StateExpectation)
     expects_tool_error: bool = False
+    #: (owner_key, memory_type, content) rows the evaluator seeds into
+    #: the scratch memory store before running this case (Step 14).
+    memories: tuple[tuple[str, str, str], ...] = ()
+    #: Optional approval lifecycle driven after the agent turn (Step 16).
+    approval_flow: ApprovalFlow | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -146,8 +216,10 @@ def case(
     stock: dict[str, int] | None = None,
     monthly_orders: int = 4,
     tool_error: bool = False,
+    memories: tuple[tuple[str, str, str], ...] = (),
+    approval_flow: ApprovalFlow | None = None,
 ) -> EvalCase:
-    """Build an EvalCase with a StateExpectation."""
+    """Build an EvalCase with a StateExpectation and optional extras."""
     return EvalCase(
         id=cid,
         category=category,
@@ -161,6 +233,8 @@ def case(
             stock=stock or {}, monthly_orders=monthly_orders
         ),
         expects_tool_error=tool_error,
+        memories=memories,
+        approval_flow=approval_flow,
     )
 
 
@@ -839,6 +913,332 @@ CASES: list[EvalCase] = [
         # No grounding facts: the honest answer is about the ABSENCE of
         # information, which by definition cannot appear in a tool result.
         # The check that matters here is that the search actually ran.
+    ),
+    # --- memory_save (Step 14: explicit remember request) -------------------
+    case(
+        "ev_105",
+        "memory_save",
+        "Tolong ingat: customer Budi suka kopi susu tanpa gula.",
+        "Simpan preferensi eksplisit ke memory store, lalu konfirmasi.",
+        ("save_memory",),
+        (1, 1),
+        (
+            tools(
+                (
+                    "save_memory",
+                    {
+                        "content": "Customer Budi suka kopi susu tanpa gula.",
+                        "memory_type": "customer_context",
+                    },
+                )
+            ),
+            say(
+                "Baik, sudah saya ingat: customer Budi suka kopi susu "
+                "tanpa gula."
+            ),
+        ),
+        facts=("Budi", "tanpa gula"),
+    ),
+    # --- memory_recall (recall a saved fact; ignore unrelated ones) ---------
+    case(
+        "ev_106",
+        "memory_recall",
+        "Apa yang saya minta diingat soal Budi?",
+        "Cari memori yang relevan dan jawab hanya dari hasilnya.",
+        ("search_memory",),
+        (1, 1),
+        (
+            tools(("search_memory", {"query": "Budi"})),
+            say(
+                "Yang Anda minta diingat: customer Budi suka kopi susu "
+                "tanpa gula."
+            ),
+        ),
+        facts=("Budi", "tanpa gula"),
+        memories=(
+            (
+                "default",
+                "customer_context",
+                "Customer Budi suka kopi susu tanpa gula.",
+            ),
+            ("default", "business_context", "Toko tutup hari Minggu."),
+        ),
+    ),
+    # --- memory_hybrid (saved preference + real business tool) --------------
+    case(
+        "ev_107",
+        "memory_hybrid",
+        "Buat pesanan untuk Budi seperti biasa.",
+        "Gunakan memori preference untuk menentukan pesanan, lalu buat "
+        "order sungguhan via database tool.",
+        ("search_memory", "create_order"),
+        (2, 2),
+        (
+            tools(("search_memory", {"query": "Budi pesanan preference"})),
+            tools(
+                (
+                    "create_order",
+                    {
+                        "customer_name": "Budi",
+                        "items": [{"product_name": "Kopi Susu", "quantity": 1}],
+                    },
+                )
+            ),
+            say(
+                "Pesanan untuk Budi dibuat: 1 Kopi Susu, sesuai "
+                "preference yang tersimpan (kopi susu tanpa gula)."
+            ),
+        ),
+        facts=("Budi", "Kopi Susu"),
+        stock={"Kopi Susu": 23},
+        monthly_orders=5,
+        memories=(
+            ("default", "preference", "Customer Budi selalu memesan Kopi Susu."),
+        ),
+    ),
+    # --- memory_isolation (another owner's memory is invisible) -------------
+    case(
+        "ev_108",
+        "memory_isolation",
+        "Hapus memori nomor 1 dong.",
+        "Memori milik owner lain tidak boleh terlihat/terhapus — "
+        "laporkan kegagalan dengan jujur.",
+        ("delete_memory",),
+        (1, 1),
+        (
+            tools(("delete_memory", {"memory_id": 1})),
+            say(
+                "Memori 1 tidak ditemukan untuk user ini — mungkin milik "
+                "pengguna lain atau sudah terhapus."
+            ),
+        ),
+        tool_error=True,
+        memories=(("other-owner", "preference", "Rahasia owner lain."),),
+    ),
+    # --- approval_lifecycle (Step 16: request is gated, never executed) ----
+    case(
+        "ev_201",
+        "approval_lifecycle",
+        "Refund pesanan ORD-0004 ya.",
+        "Refund adalah aksi sensitif: buat approval, jangan eksekusi.",
+        ("refund_order",),
+        (1, 1),
+        (
+            tools(("refund_order", {"order_id": "ORD-0004"})),
+            say(
+                "Permintaan refund ORD-0004 sudah dibuat dan menunggu "
+                "persetujuan manusia — belum dieksekusi."
+            ),
+        ),
+        stock={"Teh Manis": 30},
+        approval_flow=ApprovalFlow(action="refund_order", final_status="pending"),
+    ),
+    case(
+        "ev_202",
+        "approval_lifecycle",
+        "Refund pesanan ORD-0004 ya.",
+        "Menyetujui hanya mencatat keputusan — tidak ada eksekusi.",
+        ("refund_order",),
+        (1, 1),
+        (
+            tools(("refund_order", {"order_id": "ORD-0004"})),
+            say(
+                "Permintaan refund ORD-0004 menunggu persetujuan manusia — "
+                "belum dieksekusi."
+            ),
+        ),
+        stock={"Teh Manis": 30},
+        approval_flow=ApprovalFlow(
+            action="refund_order",
+            steps=("approve",),
+            final_status="approved",
+        ),
+    ),
+    case(
+        "ev_203",
+        "approval_lifecycle",
+        "Refund pesanan ORD-0004 ya.",
+        "Eksekusi eksplisit menjalankan refund penuh: stok kembali, "
+        "order keluar dari laporan.",
+        ("refund_order",),
+        (1, 1),
+        (
+            tools(("refund_order", {"order_id": "ORD-0004"})),
+            say(
+                "Permintaan refund ORD-0004 menunggu persetujuan manusia — "
+                "belum dieksekusi."
+            ),
+        ),
+        stock={"Teh Manis": 35},
+        monthly_orders=3,
+        approval_flow=ApprovalFlow(
+            action="refund_order",
+            steps=("approve", "execute"),
+            final_status="executed",
+            expect_result_success=True,
+        ),
+    ),
+    case(
+        "ev_208",
+        "approval_lifecycle",
+        "Batalkan pesanan ORD-0002.",
+        "Cancel via approval + eksekusi; state terminal bertahan "
+        "melewati restart simulasi.",
+        ("cancel_order",),
+        (1, 1),
+        (
+            tools(("cancel_order", {"order_id": "ORD-0002"})),
+            say(
+                "Permintaan pembatalan ORD-0002 menunggu persetujuan "
+                "manusia — belum dieksekusi."
+            ),
+        ),
+        stock={"Matcha Latte": 16},
+        monthly_orders=3,
+        approval_flow=ApprovalFlow(
+            action="cancel_order",
+            steps=("approve", "execute", "verify_persisted"),
+            final_status="executed",
+            expect_result_success=True,
+        ),
+    ),
+    # --- approval_rejection (rejected can never execute) --------------------
+    case(
+        "ev_204",
+        "approval_rejection",
+        "Refund pesanan ORD-0004 ya.",
+        "Approval yang ditolak tidak bisa dieksekusi — conflict, tanpa "
+        "efek samping.",
+        ("refund_order",),
+        (1, 1),
+        (
+            tools(("refund_order", {"order_id": "ORD-0004"})),
+            say(
+                "Permintaan refund ORD-0004 menunggu persetujuan manusia — "
+                "belum dieksekusi."
+            ),
+        ),
+        stock={"Teh Manis": 30},
+        approval_flow=ApprovalFlow(
+            action="refund_order",
+            steps=("reject", "execute_conflict"),
+            final_status="rejected",
+        ),
+    ),
+    # --- approval_concurrency (duplicate execution refused) -----------------
+    case(
+        "ev_205",
+        "approval_concurrency",
+        "Refund pesanan ORD-0001 ya.",
+        "Eksekusi kedua untuk approval yang sama harus conflict; efek "
+        "samping terjadi tepat sekali.",
+        ("refund_order",),
+        (1, 1),
+        (
+            tools(("refund_order", {"order_id": "ORD-0001"})),
+            say(
+                "Permintaan refund ORD-0001 menunggu persetujuan manusia — "
+                "belum dieksekusi."
+            ),
+        ),
+        stock={"Kopi Susu": 26},
+        monthly_orders=3,
+        approval_flow=ApprovalFlow(
+            action="refund_order",
+            steps=("approve", "execute", "execute_conflict"),
+            final_status="executed",
+            expect_result_success=True,
+        ),
+    ),
+    # --- approval_invalid (unknown tool creates no approval) ----------------
+    case(
+        "ev_206",
+        "approval_invalid",
+        "Teleport saya ke Bandung.",
+        "Tool tidak dikenal bukan aksi sensitif: error ke model, tidak "
+        "ada approval yang dibuat.",
+        ("teleport_order",),
+        (1, 1),
+        (
+            tools(("teleport_order", {"destination": "Bandung"})),
+            say("Maaf, saya tidak punya kemampuan teleportasi."),
+        ),
+        tool_error=True,
+        approval_flow=ApprovalFlow(
+            action="refund_order", expect_created=False
+        ),
+    ),
+    # --- approval_failure (business refusal -> failed, nothing changes) -----
+    case(
+        "ev_207",
+        "approval_failure",
+        "Refund pesanan ORD-9999 ya.",
+        "Order tidak ada: eksekusi berakhir failed dengan alasan "
+        "bisnis, data tidak berubah.",
+        ("refund_order",),
+        (1, 1),
+        (
+            tools(("refund_order", {"order_id": "ORD-9999"})),
+            say(
+                "Permintaan refund ORD-9999 menunggu persetujuan manusia — "
+                "belum dieksekusi."
+            ),
+        ),
+        stock={"Kopi Susu": 24},
+        approval_flow=ApprovalFlow(
+            action="refund_order",
+            steps=("approve", "execute"),
+            final_status="failed",
+        ),
+    ),
+    # --- observability_trace (execution leaves a safe trace) ----------------
+    case(
+        "ev_301",
+        "observability_trace",
+        "Refund pesanan ORD-0004 ya.",
+        "Eksekusi sukses membentuk trace APPROVAL_EXECUTING lalu "
+        "APPROVAL_EXECUTED dengan metadata aman.",
+        ("refund_order",),
+        (1, 1),
+        (
+            tools(("refund_order", {"order_id": "ORD-0004"})),
+            say(
+                "Permintaan refund ORD-0004 menunggu persetujuan manusia — "
+                "belum dieksekusi."
+            ),
+        ),
+        stock={"Teh Manis": 35},
+        monthly_orders=3,
+        approval_flow=ApprovalFlow(
+            action="refund_order",
+            steps=("approve", "execute"),
+            final_status="executed",
+            expect_result_success=True,
+            expect_trace_event="APPROVAL_EXECUTED",
+        ),
+    ),
+    case(
+        "ev_302",
+        "observability_trace",
+        "Refund pesanan ORD-9999 ya.",
+        "Eksekusi gagal membentuk trace APPROVAL_FAILED tanpa payload "
+        "di metadata.",
+        ("refund_order",),
+        (1, 1),
+        (
+            tools(("refund_order", {"order_id": "ORD-9999"})),
+            say(
+                "Permintaan refund ORD-9999 menunggu persetujuan manusia — "
+                "belum dieksekusi."
+            ),
+        ),
+        stock={"Kopi Susu": 24},
+        approval_flow=ApprovalFlow(
+            action="refund_order",
+            steps=("approve", "execute"),
+            final_status="failed",
+            expect_trace_event="APPROVAL_FAILED",
+        ),
     ),
 ]
 

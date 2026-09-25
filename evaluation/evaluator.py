@@ -38,7 +38,17 @@ from typing import Any
 from app.agent.agent import Agent
 from app.agent.glm_client import GLMResponse, ToolUse
 from app.tools.business_tools import check_stock, get_sales_report, reset_mock_data
-from .dataset import RAG_CATEGORIES, EvalCase, GLMTurn, StateExpectation, load_cases
+from .dataset import (
+    APPROVAL_CATEGORIES,
+    MEMORY_CATEGORIES,
+    OBSERVABILITY_CATEGORIES,
+    RAG_CATEGORIES,
+    ApprovalFlow,
+    EvalCase,
+    GLMTurn,
+    StateExpectation,
+    load_cases,
+)
 
 __all__ = [
     "CaseResult",
@@ -159,15 +169,28 @@ class EvaluationReport:
 def run_case(case: EvalCase) -> CaseResult:
     """Replay one case through the real Agent loop and check it.
 
-    The mock store is reseeded before the case (isolation from whatever
-    ran earlier) and after it (the evaluator must not leak mutations
-    into other test modules sharing the process).
+    The mock store, the memory store, and the approval store are
+    reseeded before the case (isolation from whatever ran earlier; the
+    case's ``memories`` rows are seeded into the scratch memory store)
+    and reset after it (the evaluator must not leak mutations into
+    other test modules sharing the process).
     """
+    from app.approval import reset_approvals
+    from app.memory import create_memory, reset_memories
+
     reset_mock_data()
+    reset_memories()
+    reset_approvals()
+    for owner_key, memory_type, content in case.memories:
+        create_memory(
+            owner_key=owner_key, memory_type=memory_type, content=content
+        )
     try:
         return _run_case(case)
     finally:
         reset_mock_data()
+        reset_memories()
+        reset_approvals()
 
 
 def _run_case(case: EvalCase) -> CaseResult:
@@ -214,8 +237,13 @@ def _run_case(case: EvalCase) -> CaseResult:
             f"expected between {minimum} and {maximum}"
         )
 
-    # 3. Task completion (expected final state via public tools).
-    state_failures = _check_state(case.expected_state)
+    # 3. Task completion: the scripted approval lifecycle first (its
+    #    executions change business data), THEN the expected final
+    #    state via public tools.
+    state_failures: list[str] = []
+    if case.approval_flow is not None:
+        state_failures.extend(_run_approval_flow(case.approval_flow))
+    state_failures.extend(_check_state(case.expected_state))
     completion_ok = not state_failures
     failures.extend(state_failures)
 
@@ -261,6 +289,119 @@ def _run_case(case: EvalCase) -> CaseResult:
         reply=reply,
         failures=tuple(failures),
     )
+
+
+def _run_approval_flow(flow: ApprovalFlow) -> list[str]:
+    """Drive one scripted approval lifecycle against the real stack.
+
+    Runs after the agent turn: finds the approval the agent created (or
+    proves none was created), applies the human steps through the real
+    manager/executor (same code the API uses, against the scratch
+    database), and checks the terminal status, the recorded result, and
+    — when requested — the observability trace contract. Business
+    effects are checked separately via the case's ``expected_state``.
+    """
+    from app.approval import (
+        ApprovalConflictError,
+        approve,
+        get_approval,
+        list_approvals,
+        reject,
+    )
+    from app.approval.executor import execute_approval
+
+    created = [a for a in list_approvals(["pending"]) if a.action == flow.action]
+    if not flow.expect_created:
+        if created or list_approvals():
+            return ["approval flow: an approval was created, but none was expected"]
+        return []
+    if not created:
+        return [f"approval flow: no pending '{flow.action}' approval was created"]
+    approval = created[0]
+    failures: list[str] = []
+
+    for step in flow.steps:
+        if step == "approve":
+            approve(approval.approval_id)
+        elif step == "reject":
+            reject(approval.approval_id)
+        elif step == "execute":
+            finished = execute_approval(approval.approval_id)
+            if (
+                flow.expect_result_success is not None
+                and finished.status == "executed"
+            ):
+                result_success = (finished.execution_result or {}).get("success")
+                if result_success is not flow.expect_result_success:
+                    failures.append(
+                        "approval flow: execution result success="
+                        f"{result_success}, expected {flow.expect_result_success}"
+                    )
+        elif step == "execute_conflict":
+            try:
+                execute_approval(approval.approval_id)
+            except ApprovalConflictError:
+                continue
+            failures.append(
+                "approval flow: duplicate execution did not raise a conflict"
+            )
+        elif step == "verify_persisted":
+            from app.db.database import dispose_engines
+
+            before = get_approval(approval.approval_id)
+            dispose_engines()  # simulated restart: only PostgreSQL knows
+            after = get_approval(approval.approval_id)
+            if after is None or before is None or after.status != before.status:
+                failures.append(
+                    "approval flow: terminal state did not survive the "
+                    "simulated restart"
+                )
+        else:  # pragma: no cover - dataset is hand-maintained
+            failures.append(f"approval flow: unknown step '{step}'")
+
+    final = get_approval(approval.approval_id)
+    if final is None or final.status != flow.final_status:
+        actual = final.status if final is not None else "missing"
+        failures.append(
+            f"approval flow: final status is '{actual}', "
+            f"expected '{flow.final_status}'"
+        )
+
+    if flow.expect_trace_event is not None:
+        failures.extend(_check_execution_trace(approval.approval_id, flow))
+
+    return failures
+
+
+def _check_execution_trace(
+    approval_id: str, flow: ApprovalFlow
+) -> list[str]:
+    """Verify the executor observability contract for one approval.
+
+    The trace run must carry APPROVAL_EXECUTING followed by the expected
+    terminal APPROVAL event, with compact metadata (approval id, action,
+    phase) and never the payload itself.
+    """
+    from app.observability import get_run_events, list_runs
+
+    runs = list_runs(source="approval_executor", limit=50)
+    events = []
+    for run in runs:
+        for event in get_run_events(run.run_id, event_type="APPROVAL") or []:
+            if (event.metadata or {}).get("approval_id") == approval_id:
+                events.append(event)
+    names = [event.event_name for event in events]
+    if names != ["APPROVAL_EXECUTING", flow.expect_trace_event]:
+        return [
+            f"observability: approval events are {names}, expected "
+            f"['APPROVAL_EXECUTING', '{flow.expect_trace_event}']"
+        ]
+    for event in events:
+        if not set(event.metadata or {}) <= {"approval_id", "action", "status"}:
+            return [
+                "observability: approval event metadata carries unexpected keys"
+            ]
+    return []
 
 
 def _setup_scratch_rag_store() -> str:
@@ -364,16 +505,29 @@ def run_evaluation(
 def format_report(report: EvaluationReport) -> str:
     """Render an EvaluationReport as the plain-text CLI report.
 
-    Business (Step 6) and knowledge/RAG (Step 12) cases are reported
-    separately in addition to the overall numbers, so RAG additions can
-    never silently shift the business-case picture.
+    Cases are grouped by concern — Business (Step 6), knowledge/RAG
+    (Step 12), Memory (Step 14), Approval execution (Step 16), and
+    Observability — so an addition in one area can never silently
+    shift another group's picture. These are deterministic workflow
+    pass rates, not model accuracy claims.
     """
     error_rate = (
         "n/a" if report.tool_error_handling_rate is None
         else f"{report.tool_error_handling_rate}%"
     )
-    business = [r for r in report.results if r.category not in RAG_CATEGORIES]
+    non_business = (
+        set(RAG_CATEGORIES)
+        | set(MEMORY_CATEGORIES)
+        | set(APPROVAL_CATEGORIES)
+        | set(OBSERVABILITY_CATEGORIES)
+    )
+    business = [r for r in report.results if r.category not in non_business]
     knowledge = [r for r in report.results if r.category in RAG_CATEGORIES]
+    memory = [r for r in report.results if r.category in MEMORY_CATEGORIES]
+    approval = [r for r in report.results if r.category in APPROVAL_CATEGORIES]
+    observability = [
+        r for r in report.results if r.category in OBSERVABILITY_CATEGORIES
+    ]
 
     def group_lines(name: str, results: list[CaseResult]) -> list[str]:
         if not results:
@@ -392,6 +546,9 @@ def format_report(report: EvaluationReport) -> str:
         "",
         *group_lines("Business cases (Step 6)", business),
         *group_lines("Knowledge/RAG cases (Step 12)", knowledge),
+        *group_lines("Memory cases (Step 14)", memory),
+        *group_lines("Approval execution cases (Step 16)", approval),
+        *group_lines("Observability cases (Step 15/16)", observability),
         "",
         f"Tool Selection Accuracy: {report.tool_selection_accuracy}%",
         f"Task Completion Rate: {report.task_completion_rate}%",

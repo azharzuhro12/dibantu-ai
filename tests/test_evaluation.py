@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.tools.registry import list_tools
+from app.tools.registry import get_tool_schemas
 from evaluation import CASES, CATEGORIES, EvalCase, load_cases
 from evaluation.dataset import GLMTurn, say, tools
 from evaluation.evaluator import (
@@ -46,7 +46,10 @@ def test_dataset_covers_every_category() -> None:
 def test_all_cases_have_required_fields() -> None:
     ids = [case.id for case in CASES]
     assert len(ids) == len(set(ids)), "case ids must be unique"
-    registered = set(list_tools())
+    # Advertised = dispatchable + sensitive-request schemas: everything
+    # the scripted GLM may legitimately ask for (sensitive calls get
+    # intercepted into approvals instead of dispatched).
+    advertised = {schema["name"] for schema in get_tool_schemas()}
     for case in CASES:
         assert case.id
         assert case.user_message.strip()
@@ -65,8 +68,8 @@ def test_all_cases_have_required_fields() -> None:
             f"{case.expected_tool_count}"
         )
         if not case.expects_tool_error:
-            assert set(case.expected_tools) <= registered, (
-                f"{case.id}: expected tools must be registered business tools"
+            assert set(case.expected_tools) <= advertised, (
+                f"{case.id}: expected tools must be advertised to the model"
             )
         assert set(case.expected_tools) == set(scripted), (
             f"{case.id}: expected_tools must match the scripted trajectory"

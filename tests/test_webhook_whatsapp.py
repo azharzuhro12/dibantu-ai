@@ -119,7 +119,10 @@ def test_webhook_replies_to_valid_message_preserving_sender() -> None:
     response = post_message(agent, "Halo, siapa kamu?")
 
     assert response.status_code == 200
-    assert response.json() == {"to": SENDER, "response": "Halo! Saya DibantuAI."}
+    body = response.json()
+    assert body["to"] == SENDER
+    assert body["response"] == "Halo! Saya DibantuAI."
+    assert body["run_id"].startswith("run-")  # Step 15 tracing id
     # The WhatsApp text was handed to the agent as the user message.
     assert len(glm.payloads) == 1
     assert glm.payloads[0]["messages"] == [
@@ -153,7 +156,10 @@ def test_webhook_stock_check_end_to_end() -> None:
     response = post_message(agent, "Cek stok kopi susu")
 
     assert response.status_code == 200
-    assert response.json() == {"to": SENDER, "response": "Stok Kopi Susu 24 unit."}
+    body = response.json()
+    assert body["to"] == SENDER
+    assert body["response"] == "Stok Kopi Susu 24 unit."
+    assert body["run_id"].startswith("run-")
     # The real business tool ran and its result reached GLM.
     tool_result = glm.payloads[1]["messages"][2]["content"][0]
     assert tool_result["tool_use_id"] == "toolu_check_stock"
@@ -246,9 +252,12 @@ def test_webhook_tool_error_does_not_crash() -> None:
     response = post_message(agent, "Teleport saya ke Bandung")
 
     assert response.status_code == 200
-    assert response.json() == {
+    body = response.json()
+    assert body == {
         "to": SENDER,
         "response": "Maaf, saya tidak punya kemampuan itu.",
+        "run_id": body["run_id"],  # present, format checked elsewhere
     }
+    assert body["run_id"].startswith("run-")
     tool_result = glm.payloads[1]["messages"][2]["content"][0]
     assert tool_result["content"] == '{"error": "Unknown tool: teleport"}'

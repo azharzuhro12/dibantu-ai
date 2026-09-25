@@ -9,10 +9,12 @@ Masalah yang dipecahkan: pemilik usaha kecil tidak butuh aplikasi kasir kompleks
 - **Chat agent dengan tool calling** — agent memanggil business tools (stok, order, customer, laporan) lewat loop GLM; tidak pernah mengarang data bisnis.
 - **RAG knowledge base (Step 12)** — agent menjawab pertanyaan kebijakan/prosedur (refund, stok, order) dari dokumen basis pengetahuan lokal (ChromaDB + embeddings lokal), lengkap dengan sitasi sumber; data bisnis live tetap di PostgreSQL dan keduanya tidak pernah tertukar.
 - **PostgreSQL persistence** — data bisnis tersimpan di Postgres (SQLAlchemy + Alembic migration); restart container tidak menghilangkan data.
-- **Human-in-the-loop approval** — aksi sensitif (refund, cancel order, bulk stock update) tidak dieksekusi agent; menunggu persetujuan manusia lewat API/frontend.
+- **Human-in-the-loop approval (Step 8 → 16)** — aksi sensitif (refund, cancel order, bulk stock update) tidak pernah dieksekusi agent; ia membuat approval persisten, manusia memutuskan, lalu **eksekusi eksplisit** menjalankan aksi tepat sekali dari snapshot payload immutable (allowlist executor, claim atomik di database).
+- **Agent memory persisten (Step 14)** — fakta eksplisit (preferensi, konteks customer/bisnis, instruksi) tersimpan per owner di PostgreSQL dan di-inject sebagai konteks kecil di prompt; ada layar rahasia dan isolasi antar owner.
+- **Observability (Step 15)** — setiap eksekusi agent ditrace end-to-end di PostgreSQL (LLM, tool, memory, RAG, approval) dengan satu `run_id` stabil yang dikembalikan ke pemanggil; metadata aman by construction (tanpa prompt/respon/rahasia).
 - **WhatsApp webhook simulator** — endpoint webhook ber-format WhatsApp untuk pengujian lokal (bukan integrasi Meta sungguhan).
-- **Dashboard Next.js** — halaman chat, inventory, orders, reports, dan approvals.
-- **Evaluation suite deterministik** — 38 skenario offline yang memverifikasi tool selection, task completion, error handling, dan grounding jawaban (34 bisnis + 4 RAG).
+- **Dashboard Next.js** — halaman chat, inventory, orders, reports, approvals, memory, dan observability.
+- **Evaluation suite deterministik** — 52 skenario offline yang memverifikasi tool selection, task completion, error handling, dan grounding jawaban (34 bisnis + 4 RAG + 4 memori + 8 approval + 2 observability).
 
 ## Arsitektur & Alur Agent
 
@@ -128,15 +130,22 @@ python -m app.rag.ingest      # ingest knowledge base (sekali; download model pe
 | GET | `/docs` | Swagger UI (OpenAPI). |
 | POST | `/api/chat` | Chat dengan agent (tool calling). |
 | POST | `/webhook/whatsapp` | Simulator webhook WhatsApp (lokal, tanpa Meta). |
-| GET | `/api/approvals` | Daftar approval pending. |
-| POST | `/api/approvals/{id}/approve` | Setujui approval. |
-| POST | `/api/approvals/{id}/reject` | Tolak approval. |
+| GET | `/api/approvals` | Daftar approval (default: pending; `?status=approved\|rejected\|executing\|executed\|failed\|all` untuk lifecycle penuh). |
+| POST | `/api/approvals/{id}/approve` | Setujui approval (opsional `?reason=...`, maks 500 karakter) — hanya mencatat keputusan. |
+| POST | `/api/approvals/{id}/reject` | Tolak approval (opsional `?reason=...`, tercatat sebagai `decision_reason`) — terminal, tidak bisa dieksekusi. |
+| POST | `/api/approvals/{id}/execute` | **(Step 16)** Eksekusi approval yang approved — tepat sekali, dari payload snapshot di server; endpoint tidak menerima argumen. 409 untuk status lain. |
 | GET | `/api/knowledge/search?q=...` | Cari passage di knowledge base (retrieval saja, tanpa LLM). |
 | POST | `/api/knowledge/ingest` | (Re)ingest dokumen knowledge base (idempotent; tanpa parameter path — selalu direktori terkonfigurasi). |
+| GET | `/api/memory?owner_key=...` | Daftar memori agent satu owner, terbaru dulu (opsional `memory_type`, `q`, `limit`). |
+| POST | `/api/memory` | Buat memori (`owner_key` opsional, `memory_type`, `content`). |
+| DELETE | `/api/memory/{id}?owner_key=...` | Hapus memori milik owner tersebut (id owner lain = 404). |
+| GET | `/api/observability/runs` | Daftar run agent ter-trace, terbaru dulu (filter opsional `status`, `source`, `owner_key`, `limit`). |
+| GET | `/api/observability/runs/{run_id}` | Satu run berdasarkan `run_id` stabil. |
+| GET | `/api/observability/runs/{run_id}/events` | Timeline event run tersebut (filter opsional `event_type`, `limit`). |
 
 ## Database
 
-Skema (migration `alembic/versions/0001`): `products`, `customers`, `orders`, `order_items` — uang memakai `Numeric(12,2)` (bukan float), FK + index lengkap, nama produk/customer unik case-insensitive.
+Skema (migration `alembic/versions/0001`): `products`, `customers`, `orders`, `order_items` — uang memakai `Numeric(12,2)` (bukan float), FK + index lengkap, nama produk/customer unik case-insensitive. Migration `0002` menambah tabel `approvals` (lihat [Approval Persisten](#approval-persisten-step-13)), `0003` tabel `agent_memories` ([Agent Memory](#agent-memory-step-14)), `0004` tabel `agent_runs` + `agent_events` ([Observability](#observability-step-15)), dan `0005` kolom eksekusi approval + `orders.refunded_amount` ([Approval Execution](#human-in-the-loop-approval-execution-step-16)).
 
 ```bash
 # inspeksi database
@@ -190,18 +199,117 @@ Setiap dokumen di-hash; dokumen yang tidak berubah di-skip, dokumen berubah diga
 
 > Dokumen di `data/knowledge/` adalah **kebijakan bisnis demo/contoh** untuk portfolio — bukan kebijakan perusahaan nyata. Menambah dokumen baru: taruh file `.md` di `data/knowledge/`, jalankan ulang ingestion.
 
+## Approval Persisten (Step 13)
+
+Human-in-the-loop approval untuk aksi sensitif (`refund_order`, `cancel_order`, `bulk_stock_update`) kini disimpan di tabel PostgreSQL `approvals` (migration `0002`), bukan lagi dict in-memory — **pending approval dan keputusannya selamat dari restart backend/container**.
+
+**Lifecycle:**
+
+```
+agent minta aksi sensitif
+  → intersepsi di Agent._run_tool (tool TIDAK dieksekusi)
+  → baris `approvals` dibuat dengan status pending
+  → agent memberi tahu user approval_id
+  → manusia approve/reject via API (opsional ?reason=...)
+  → keputusan + timestamp + alasan dipersistenkan
+```
+
+Jaminan keamanan yang dipertahankan:
+
+- Aksi sensitif **tidak pernah dieksekusi** hanya karena ada approval — approve hanya mencatat keputusan manusia; tidak ada jalur eksekusi otomatis setelahnya.
+- Keputusan dijalankan sebagai satu `UPDATE ... WHERE status = 'pending'` (atomic di level database): dua request bersamaan tidak bisa keduanya berhasil; yang kedua mendapat HTTP 409.
+- Transisi status invalid ditolak: `approved → rejected`, `rejected → approved`, dan keputusan ulang semuanya 409; id yang tidak ada 404.
+- Payload approval disimpan untuk direview manusia — berisi parameter aksi bisnis, bukan kredensial.
+
+**Limitasi (sama seperti Step 8, kini persisten):** approve hanya mencatat keputusan — tidak ada eksekusi refund/pembatalan yang dijadwalkan ulang setelah approval (deferred execution belum diimplementasikan). Endpoint approval juga belum memakai autentikasi.
+
+## Human-in-the-Loop Approval Execution (Step 16)
+
+Approval kini **benar-benar bisa melanjutkan ke eksekusi** — tapi hanya lewat aksi manusia eksplisit, tepat sekali, dari snapshot payload yang tersimpan. Tiga aksi sensitif punya implementasi bisnis riil dan transaksional di `app/tools/sensitive_actions.py` (refund/cancel mengembalikan stok + menyesuaikan agregat; bulk update multi-produk dalam satu transisi), dieksekusi **hanya** oleh executor setelah manusia approve.
+
+**State machine (migration `0005`, CHECK di database):**
+
+```
+pending ──→ approved ──→ executing ──→ executed
+   │                        └──→ failed
+   └──→ rejected   (terminal — tidak bisa dieksekusi)
+```
+
+Transisi di luar tabel ini ditolak `validate_transition`; `executing`/`executed`/`failed` terminal. Alur lengkap:
+
+```
+user minta aksi sensitif
+  → agent memanggil (skema request aksi sensitif diiklankan; TIDAK dispatchable)
+  → intersepsi: approval pending dibuat dengan snapshot payload immutable
+  → agent memberi tahu user approval_id (aksi TIDAK dijalankan)
+  → manusia approve (hanya mencatat keputusan)
+  → manusia klik Execute / POST /api/approvals/{id}/execute
+  → executor: claim atomik approved→executing → eksekusi → executed/failed
+```
+
+**Jaminan desain:**
+
+- **Immutable execution snapshot** — eksekusi memakai payload yang tersimpan saat approval dibuat; endpoint execute **tidak menerima argumen apa pun**. "Approve request A tapi eksekusi request B" mustahil by construction; client tidak bisa mengirim ulang/mengubah payload.
+- **Allowlist eksplisit** — executor hanya menjalankan 3 aksi di `APPROVED_EXECUTABLE_TOOLS` (nama → fungsi); bukan generic runner. Nama tool arbitrer/non-allowlist ditolak 422 tanpa perubahan state; validasi struktur payload (per-item untuk bulk) juga pre-claim.
+- **Atomic concurrency claim** — `approved → executing` adalah satu `UPDATE ... WHERE status='approved'`: dari dua execute bersamaan tepat satu mendapat rowcount 1; yang kalah menerima 409. Database (bukan lock in-process) adalah autoritas concurrency.
+- **Idempotensi** — execute atas `pending`/`rejected`/`executing`/`executed`/`failed` semuanya 409 tanpa efek samping; double refund/double stock update karena browser refresh/duplicate request mustahil. Lapisan bisnis juga menolak refund/cancel order yang sudah terminal (defense in depth).
+- **Refund parsial vs penuh** — tanpa `amount` (atau `amount` == sisa): refund penuh → stok dikembalikan, agregat customer dibatalkan, order `refunded` (keluar dari laporan — `orders_since` kini hanya menghitung order `completed`). `amount` lebih kecil: refund parsial → uang saja (`refunded_amount` kumulatif di-cap total order, cek antar-approval), barang dianggap tetap dipegang, order tetap `completed`.
+- **Execution result** — hasil tool disimpan di kolom `execution_result` (JSON) dan dikembalikan di response; kegagalan menyimpan pesan bisnis ber-bound (`execution_error` ≤ 500 karakter — tanpa traceback, tanpa kredensial).
+- **Observability** — tiap eksekusi membentuk satu trace run (`source=approval_executor`): `APPROVAL_EXECUTING` → `APPROVAL_EXECUTED`/`APPROVAL_FAILED` (+ RUN_STARTED/COMPLETED), metadata aman hanya `{approval_id, action, status}` — payload tidak pernah masuk trace. Kegagalan tracing ditelan; tidak pernah menggagalkan eksekusi.
+- **Persisten** — status, timestamps, result, dan error eksekusi tersimpan di PostgreSQL; selamat dari restart (diverifikasi live).
+
+**Batasan (jujur):** approval `executing` bisa **stuck** jika proses mati setelah claim sebelum tulis status terminal (belum ada mekanisme recovery/re-scan); `failed` terminal tanpa explicit retry design (buat approval baru untuk mencoba lagi); endpoint approval **belum ada autentikasi/otorisasi** (siapa pun yang bisa memanggil API bisa approve/execute); eksekusi **tidak pernah otomatis oleh agent** (by design); dan batas aksi sensitif Step 8 yang masih berlaku: perubahan stok beberapa produk bisa "melewati" approval `bulk_stock_update` lewat beberapa kali `update_stock` reguler — agent dilarang lewat deskripsi tool, tapi tidak dicegah secara struktural.
+
+## Agent Memory (Step 14)
+
+Agent bisa mengingat **fakta eksplisit** lintas percakapan — preferensi, konteks customer, konteks bisnis, instruksi — di tabel PostgreSQL `agent_memories` (migration `0003`), sehingga selamat dari restart. Ini bukan riwayat percakapan: hanya fakta terstruktur yang diminta disimpan.
+
+**Tipe memori** (tertutup, di-CHECK di database): `preference`, `customer_context`, `business_context`, `instruction`.
+
+**Ownership:** `owner_key` — identitas level aplikasi, **bukan autentikasi**. Webhook WhatsApp memakai nomor sender; `/api/chat` menerima `owner_key` opsional (default `"default"`, client lama tetap jalan). Semua operasi memori (service, API, tool) di-scope per owner; update/delete memakai `UPDATE/DELETE ... WHERE id = ? AND owner_key = ?` sehingga owner lain tidak bisa mengubah — dan tidak bisa mem-probe keberadaan id owner lain (404 sama seperti id tak dikenal).
+
+**Alur:**
+
+```
+request (owner_key)
+  → retrieval deterministik: keyword overlap + recency (TANPA embedding — itu urusan RAG)
+  → maksimal 3 memori relevan ditambahkan ke system prompt sebagai "Known facts"
+  → tanpa memori, prompt & perilaku agent identik seperti sebelum Step 14
+```
+
+**Tulisan memori dikendalikan ketat** — model tidak bisa menulis semaunya: tool `save_memory` hanya dipakai atas permintaan eksplisit user (aturan prompt #9), input divalidasi aplikasi sebelum persist (tipe tertutup, konten ≤ 2000 karakter), dan **layar rahasia** menolak konten mirip password/API key/token/nomor kartu. Tool memori (`save_memory`, `search_memory`, `delete_memory`) otomatis terikat owner request saat itu — model tidak bisa memilih owner lain.
+
+**Keamanan:** memori murni konteks — tidak ada jalur dari memori ke eksekusi aksi bisnis, modifikasi order/stok, RAG, atau approval. Memori dan knowledge base tetap konsep terpisah.
+
+**Batasan:** belum ada autentikasi (owner_key bisa diklaim siapa saja yang bisa memanggil API — sama seperti endpoint lain di proyek ini); retrieval keyword saja (bukan semantik); tidak ada UI untuk mengedit memori (hanya lihat/hapus).
+
+## Observability (Step 15)
+
+Setiap eksekusi agent ditrace **end-to-end** di dua tabel PostgreSQL (migration `0004`): satu baris `agent_runs` per eksekusi, satu baris `agent_events` per operasi yang ditrace — call LLM, eksekusi tool (diklasifikasikan: TOOL/MEMORY/RAG/APPROVAL), dengan nomor iterasi loop dan durasi. Semua diikat satu `run_id` stabil yang ikut dikembalikan di response `/api/chat` dan webhook, sehingga keluhan user bisa langsung dicari run-nya. **PostgreSQL-only, tanpa platform observability eksternal.**
+
+**Aman by construction** — bukan sekadar "kami hati-hati":
+
+- Tidak ada prompt, respon mentah, chain-of-thought, rahasia, atau stack trace — hanya nama kelas exception (`error_type`), maksimal 160 karakter preview request, dan metadata kecil (≤ 12 kunci, ≤ 400 karakter per nilai, shallow copy).
+- Preview request yang mengandung penanda rahasia (`api key`, `password`, `token`, `sk-`, dst.) atau nomor kartu disimpan sebagai NULL, bukan dipotong.
+- Kegagalan tracing **ditelan** oleh recorder — observability tidak pernah bisa merusak request bisnis; error bisnis tetap dipropagasi setelah run ditandai `failed`.
+- `agent_events` sengaja tanpa foreign key ke `agent_runs` — setiap tulisan independen, kegagalan parsial tidak pernah cascade.
+
+**Usage token** (`input_tokens`/`output_tokens`) diambil dari respons provider saat ada (tidak pernah dikarang) dan hanya masuk metadata observability. Keputusan approve/reject juga ditrace (informasional — tidak mengeksekusi apa pun).
+
+**Batasan:** tracing level operasi (bukan baris-per-baris audit log); belum ada agregat/metric (mis. token per hari); retention/retensi data run belum diatur (tabel tumbuh sampai dibersihkan manual); endpoint observability belum memakai autentikasi.
+
 ## Testing & Evaluation
 
 ```bash
 docker compose up -d postgres   # test database butuh Postgres
 source .venv/bin/activate
-pytest -q                       # 218 test
-python -m evaluation.evaluator  # 38 skenario
+pytest -q                       # 350 test (+1 skip)
+python -m evaluation.evaluator  # 52 skenario
 ```
 
 - Test bisnis/DB berjalan di **database scratch terpisah** (`dibantu_ai_test`, dibuat & di-drop otomatis) — tidak pernah menyentuh data bisnis utama. Tanpa Postgres, test DB di-skip dengan alasan eksplisit.
 - Test & evaluasi RAG memakai **embeddings `hashing` deterministik + vector store scratch di tmp** — tanpa download model, tanpa network, dan `data/rag` milik developer tidak pernah disentuh (test model lokal men-skip dirinya jika model tak bisa di-download).
-- Evaluation **deterministik dan offline** (client script, tanpa API key): 38 skenario (34 bisnis + 4 RAG), 100% pass rate — memverifikasi tool selection, jumlah tool call, task completion, error handling, dan grounding jawaban. Laporan evaluasi memisahkan angka bisnis vs RAG. Ini bukan klaim akurasi model.
+- Evaluation **deterministik dan offline** (client script, tanpa API key): 52 skenario (34 bisnis + 4 RAG + 4 memori + 8 approval + 2 observability), 100% pass rate — memverifikasi tool selection, jumlah tool call, task completion, error handling, dan grounding jawaban. Skenario approval menjalankan siklus hidup penuh (create → approve/reject → execute → conflict → persist) lewat manager/executor sungguhan; skenario observability memverifikasi kontrak trace eksekusi. Laporan evaluasi memisahkan kelima grup tersebut. Ini bukan klaim akurasi model.
 
 ## Struktur Project
 
@@ -209,10 +317,12 @@ python -m evaluation.evaluator  # 38 skenario
 dibantu-ai/
 ├── app/
 │   ├── agent/          # Agent loop + GLM client
-│   ├── api/            # Routes (chat, webhook, approvals, knowledge)
-│   ├── approval/       # Human-in-the-loop approval store
+│   ├── api/            # Routes (chat, webhook, approvals, knowledge, memory)
+│   ├── approval/       # Human-in-the-loop approval store (persisten)
 │   ├── db/             # Engine/session, models, repository, seed
+│   ├── memory/         # Agent memory: repository, manager, tools
 │   ├── models/         # Schema Pydantic
+│   ├── observability/  # Tracing run/event: manager, repository (PostgreSQL-only)
 │   ├── rag/            # RAG: chunker, embeddings, vector store, retriever, service, tool, CLI
 │   └── tools/          # Business tools + registry
 ├── alembic/            # Migration database
@@ -222,15 +332,17 @@ dibantu-ai/
 ├── docker/             # entrypoint.sh (migrate + seed + uvicorn)
 ├── evaluation/         # Dataset + evaluator deterministik
 ├── frontend/           # Dashboard Next.js
-├── tests/              # 218 test pytest
+├── tests/              # 350 test pytest (1 skip kondisional)
 ├── docker-compose.yml
 └── Dockerfile
 ```
 
 ## Status & Limitations
 
-🚧 **Step 12: RAG / Knowledge Base — selesai.** Seluruh Step 1–11 (agent + tool calling + approval + webhook simulator + PostgreSQL persistence) tetap utuh, ditambah knowledge base lokal: retrieval ChromaDB + embeddings lokal, tool `search_knowledge_base` di agent, endpoint knowledge API, ingestion idempotent, 218 test, dan evaluasi 38/38.
+🚧 **Step 16: Human-in-the-Loop Approval Execution — selesai.** Step 1–15 tetap utuh, ditambah state machine approval 6-status (migration `0005`), implementasi transaksional nyata untuk tiga aksi sensitif (`app/tools/sensitive_actions.py`: refund penuh/parsial, cancel order, bulk stock update), executor allowlist dengan claim atomik `approved → executing` di database (autoritas concurrency, bukan lock in-process), endpoint `POST /api/approvals/{id}/execute` tanpa argumen (payload snapshot immutable), tombol Execute + badge status di halaman Approvals frontend, dan trace khusus per eksekusi (`source=approval_executor`). Eksekusi tepat sekali by construction; approve tetap hanya mencatat keputusan.
 
-Belum diimplementasikan: WhatsApp Cloud API sungguhan (Meta auth + verifikasi signature), tunnel ngrok, integrasi Google Sheets, autentikasi, dan deployment. Approval store masih in-memory (single-process MVP). Endpoint inventory/orders/reports khusus belum ada — halaman frontend terkait masih lewat assistant.
+Riwayat langkah sebelumnya: Step 15 menambah observability end-to-end (`agent_runs`/`agent_events`, `run_id` stabil, halaman Observability); Step 14 memori persisten per owner; Step 13 approval persisten; Step 12 RAG knowledge base; Step 11 PostgreSQL; Step 8 approval human-in-the-loop; Step 6 evaluation suite.
+
+Belum diimplementasikan: WhatsApp Cloud API sungguhan (Meta auth + verifikasi signature), tunnel ngrok, integrasi Google Sheets, autentikasi, dan deployment. Endpoint inventory/orders/reports khusus belum ada — halaman frontend terkait masih lewat assistant.
 
 Limitasi RAG saat ini: tidak ada UI manajemen dokumen (tambah/ubah dokumen = edit file + re-ingest); dokumen yang dihapus dari `data/knowledge/` tidak otomatis menghapus chunk lama di store (re-ingest dokumen berubah sudah ditangani); belum ada re-ranking maupun filter similarity threshold (relevansi dinilai GLM dari passage yang kembali); embedding model default berbahasa Inggris — dokumen Indonesia tetap ter-retrieve dengan baik lewat overlap kosakata, tapi model multibahasa (mis. `paraphrase-multilingual-MiniLM`) bisa lebih akurat dan tinggal ganti `RAG_EMBEDDING_MODEL` + hapus `data/rag/` + re-ingest.

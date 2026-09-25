@@ -197,11 +197,17 @@ def order_as_dict(order: Order) -> dict[str, Any]:
 
 
 def orders_since(session: Session, cutoff: datetime) -> list[Order]:
-    """Orders created at/after ``cutoff``, oldest first (items loaded)."""
+    """Completed orders created at/after ``cutoff``, oldest first.
+
+    Refunded and cancelled orders (Step 16) are excluded: their stock
+    was restored and their revenue undone, so counting them would
+    overstate the window. ``created_at`` (not the decision time) keeps
+    the window stable regardless of when a refund happens.
+    """
     return list(
         session.scalars(
             select(Order)
-            .where(Order.created_at >= cutoff)
+            .where(Order.created_at >= cutoff, Order.status == "completed")
             .options(selectinload(Order.items))
             .order_by(Order.created_at, Order.id)
         )

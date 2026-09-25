@@ -1,4 +1,4 @@
-"""Tests for app.tools.registry (Step 4A → Step 12: + knowledge tool)."""
+"""Tests for app.tools.registry (Step 4A → Step 14: + knowledge, memory)."""
 
 import sys
 from pathlib import Path
@@ -9,6 +9,7 @@ if str(ROOT) not in sys.path:
 
 import pytest
 
+from app.memory import memory_tools
 from app.rag.knowledge_tool import search_knowledge_base
 from app.tools import business_tools, registry
 
@@ -20,6 +21,9 @@ EXPECTED_TOOLS = {
     "get_sales_report",
     "get_low_stock",
     "search_knowledge_base",
+    "save_memory",
+    "search_memory",
+    "delete_memory",
 }
 
 EXPECTED_REQUIRED = {
@@ -30,12 +34,15 @@ EXPECTED_REQUIRED = {
     "get_sales_report": set(),
     "get_low_stock": {"threshold"},
     "search_knowledge_base": {"query"},
+    "save_memory": {"content"},
+    "search_memory": {"query"},
+    "delete_memory": {"memory_id"},
 }
 
 
-def test_list_tools_registers_all_seven_tools():
+def test_list_tools_registers_all_ten_tools():
     assert set(registry.list_tools()) == EXPECTED_TOOLS
-    assert len(registry.list_tools()) == 7
+    assert len(registry.list_tools()) == 10
 
 
 def test_reset_mock_data_is_not_exposed():
@@ -58,6 +65,9 @@ def test_list_tools_returns_a_copy():
         ("get_sales_report", business_tools.get_sales_report),
         ("get_low_stock", business_tools.get_low_stock),
         ("search_knowledge_base", search_knowledge_base),
+        ("save_memory", memory_tools.save_memory),
+        ("search_memory", memory_tools.search_memory),
+        ("delete_memory", memory_tools.delete_memory),
     ],
 )
 def test_get_tool_returns_the_underlying_function(name, func):
@@ -71,8 +81,18 @@ def test_get_tool_unknown_name_returns_none():
 
 def test_get_tool_schemas_covers_every_registered_tool():
     schemas = registry.get_tool_schemas()
-    assert {schema["name"] for schema in schemas} == EXPECTED_TOOLS
-    assert len(schemas) == 7
+    advertised = set(EXPECTED_TOOLS) | set(registry.SENSITIVE_REQUEST_TOOLS)
+    assert {schema["name"] for schema in schemas} == advertised
+    assert len(schemas) == 13  # 10 dispatchable + 3 sensitive-request
+
+
+def test_sensitive_actions_are_advertised_but_never_dispatchable():
+    """Requesting a sensitive action creates an approval; it can never
+    be dispatched through the registry (Step 16)."""
+    for name in registry.SENSITIVE_REQUEST_TOOLS:
+        assert registry.get_tool(name) is None
+        assert name not in registry.list_tools()
+        assert name in {schema["name"] for schema in registry.get_tool_schemas()}
 
 
 def test_schemas_use_the_anthropic_tool_format():

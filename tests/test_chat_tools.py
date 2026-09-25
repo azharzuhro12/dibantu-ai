@@ -39,6 +39,15 @@ REGISTERED_TOOL_NAMES = [
     "get_sales_report",
     "get_low_stock",
     "search_knowledge_base",
+    "save_memory",
+    "search_memory",
+    "delete_memory",
+    # Advertised sensitive-request schemas (Step 16): the model can ask
+    # for these, which creates a human approval — they are never
+    # dispatchable (get_tool still returns None for them).
+    "refund_order",
+    "cancel_order",
+    "bulk_stock_update",
 ]
 
 
@@ -143,7 +152,9 @@ def test_chat_direct_response_without_tool_calls() -> None:
     response = post_chat(agent, "Halo, siapa kamu?")
 
     assert response.status_code == 200
-    assert response.json() == {"response": "Halo! Saya DibantuAI."}
+    body = response.json()
+    assert body["response"] == "Halo! Saya DibantuAI."
+    assert body["run_id"].startswith("run-")  # Step 15 tracing id
     assert len(glm.payloads) == 1
     # The agent advertises the registry schemas and the Step 4 prompt.
     assert glm.payloads[0]["tools"] == get_tool_schemas()
@@ -169,9 +180,9 @@ def test_chat_single_tool_call_end_to_end() -> None:
     response = post_chat(agent, "Berapa stok Croissant?")
 
     assert response.status_code == 200
-    assert response.json() == {
-        "response": "Stok Croissant tersisa 8 unit dengan harga Rp25.000."
-    }
+    body = response.json()
+    assert body["response"] == "Stok Croissant tersisa 8 unit dengan harga Rp25.000."
+    assert body["run_id"].startswith("run-")  # Step 15 tracing id
     assert len(glm.payloads) == 2
     second_messages = glm.payloads[1]["messages"]
     assert second_messages[1] == {
@@ -276,7 +287,9 @@ def test_chat_unknown_tool_returns_error_result_to_model() -> None:
     response = post_chat(agent, "Teleport saya ke Bandung.")
 
     assert response.status_code == 200
-    assert response.json() == {"response": "Maaf, saya tidak punya kemampuan untuk itu."}
+    body = response.json()
+    assert body["response"] == "Maaf, saya tidak punya kemampuan untuk itu."
+    assert body["run_id"].startswith("run-")  # Step 15 tracing id
     messages = glm.payloads[1]["messages"]
     assert messages[2]["content"][0] == {
         "type": "tool_result",
@@ -303,7 +316,9 @@ def test_chat_tool_exception_is_reported_to_model() -> None:
     response = post_chat(agent, "Berapa stok Kopi Susu?")
 
     assert response.status_code == 200
-    assert response.json() == {"response": "Maaf, pemeriksaan stok sedang gagal."}
+    body = response.json()
+    assert body["response"] == "Maaf, pemeriksaan stok sedang gagal."
+    assert body["run_id"].startswith("run-")  # Step 15 tracing id
     messages = glm.payloads[1]["messages"]
     assert messages[2]["content"][0] == {
         "type": "tool_result",

@@ -1,4 +1,4 @@
-# DibantuAI Agent Evaluation (Step 6 → Step 12)
+# DibantuAI Agent Evaluation (Step 6 → Step 16)
 
 A lightweight, deterministic, offline evaluation framework for the
 DibantuAI agent. No LangChain/LangGraph, no external model API, no API
@@ -10,7 +10,9 @@ key, no network — every run produces identical results.
   `category`, `user_message`, `expected_behavior`, `expected_tools`,
   `expected_tool_count` (inclusive min/max), a scripted GLM trajectory
   (`glm_turns`), `grounding_facts`, an `expected_state`, and
-  `expects_tool_error`.
+  `expects_tool_error`. Step 14 added seeded `memories` rows; Step 16
+  added an optional `approval_flow` (a scripted human lifecycle applied
+  after the agent turn).
 - `evaluator.py` — `ScriptedGLMClient`, `run_case`, `run_evaluation`,
   metrics, and the CLI (`python -m evaluation.evaluator`).
 
@@ -35,8 +37,21 @@ Since Step 12, `knowledge_*` cases also run the **real**
 `search_knowledge_base` tool — against a scratch vector store the
 evaluator ingests into a temporary directory with deterministic
 `hashing` embeddings (no model download, no network; the developer's
-real `data/rag` store is never touched). The CLI report separates
-business cases (Step 6) from knowledge/RAG cases (Step 12).
+real `data/rag` store is never touched).
+
+Since Step 16, `approval_*` cases drive the **real** approval
+lifecycle after the agent turn: the scripted agent request creates (or
+must not create) a pending approval, then `ApprovalFlow.steps` apply
+the human side deterministically through the real manager and executor
+(`approve`, `reject`, `execute`, `execute_conflict`,
+`verify_persisted` — a dispose/recreate engine cycle that simulates a
+restart) against the same scratch database. `observability_trace`
+cases verify the executor's trace contract: exactly one run with
+`APPROVAL_EXECUTING` followed by the terminal event, and metadata
+never carrying the payload. The CLI report separates five groups —
+Business (Step 6), Knowledge/RAG (Step 12), Memory (Step 14), Approval
+execution (Step 16), and Observability — so an addition in one area
+can never silently shift another group's picture.
 
 ## Checks per case (all must hold for a pass)
 
@@ -44,7 +59,7 @@ business cases (Step 6) from knowledge/RAG cases (Step 12).
 |---|---|
 | Tool selection | The set of executed tools equals `expected_tools`. |
 | Tool call count | Executions within `expected_tool_count` bounds. |
-| Task completion | Final mock-store state matches `expected_state` (product stocks + 30-day order count, read via public tools). |
+| Task completion | Final mock-store state matches `expected_state` (product stocks + 30-day order count, read via public tools); for Step 16 cases this also includes the scripted approval lifecycle outcome (terminal status, execution result, trace contract). |
 | Tool error handling | For error cases: the failed/unknown tool came back as an `{"error": ...}` tool_result and the run completed. |
 | Response grounding | Every `grounding_fact` appears in the final reply AND in a tool result the agent really received. |
 
@@ -72,4 +87,8 @@ Append a `case(...)` entry to `CASES` in `dataset.py`. Give it a unique
 id, one of the categories in `CATEGORIES`, a scripted trajectory whose
 tool inputs match the seeded store (see the seed reference in the
 module docstring), and expectations derived only from what the tools
-actually return.
+actually return. Sensitive-action cases script the tool call the model
+requests (e.g. `refund_order`), keep `expected_state` at the
+pre-execution values, and describe the human side via
+`approval_flow=ApprovalFlow(...)`; the state after execution is then
+asserted through the same public `expected_state` check.

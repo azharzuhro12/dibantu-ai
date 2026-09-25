@@ -16,14 +16,23 @@ import {
   IconChart,
   IconChat,
   IconMenu,
+  IconPulse,
   IconShield,
+  IconSparkles,
   IconX,
 } from "@/components/icons";
 import { usePendingApprovalCount } from "@/hooks/use-pending-approval-count";
 import { API_HOST_LABEL } from "@/lib/api";
 
 type NavItem = {
-  href: "/chat" | "/inventory" | "/orders" | "/reports" | "/approvals";
+  href:
+    | "/chat"
+    | "/inventory"
+    | "/orders"
+    | "/reports"
+    | "/approvals"
+    | "/memory"
+    | "/observability";
   label: string;
   icon: (props: { className?: string }) => React.ReactElement;
   badge?: "approvals";
@@ -32,7 +41,10 @@ type NavItem = {
 const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
   {
     label: "Assistant",
-    items: [{ href: "/chat", label: "Chat", icon: IconChat }],
+    items: [
+      { href: "/chat", label: "Chat", icon: IconChat },
+      { href: "/memory", label: "Memory", icon: IconSparkles },
+    ],
   },
   {
     label: "Operations",
@@ -49,6 +61,7 @@ const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
     label: "Governance",
     items: [
       { href: "/approvals", label: "Approvals", icon: IconShield, badge: "approvals" },
+      { href: "/observability", label: "Observability", icon: IconPulse },
     ],
   },
 ];

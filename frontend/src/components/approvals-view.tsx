@@ -1,13 +1,18 @@
 "use client";
 
 /**
- * Human-in-the-loop approvals, wired to the real backend:
- *   GET  /api/approvals
+ * Human-in-the-loop approvals across the full lifecycle, wired to the
+ * real backend:
+ *   GET  /api/approvals?status=all
  *   POST /api/approvals/{id}/approve
  *   POST /api/approvals/{id}/reject
+ *   POST /api/approvals/{id}/execute   (Step 16)
  *
- * Handles loading, refresh, 404 (approval vanished) and 409 (already
- * decided) explicitly.
+ * Pending approvals wait for a human decision; approved ones wait for
+ * the explicit Execute action; executed/failed/rejected ones stay
+ * visible as history. Duplicate executes surface the backend's 409
+ * (already executing / already executed) as a clear notice — the
+ * backend's atomic claim, not the UI, guarantees single execution.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -26,6 +31,7 @@ import {
   ApiError,
   approveApproval,
   type Approval,
+  executeApproval,
   listApprovals,
   rejectApproval,
 } from "@/lib/api";
@@ -52,6 +58,7 @@ export function ApprovalsView() {
     id: string;
     decision: "approve" | "reject";
   } | null>(null);
+  const [executingId, setExecutingId] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -73,7 +80,7 @@ export function ApprovalsView() {
 
   const refresh = useCallback(async () => {
     try {
-      const response = await listApprovals();
+      const response = await listApprovals("all");
       setApprovals(response.approvals);
       setLoadError(null);
     } catch (caught) {
@@ -126,22 +133,18 @@ export function ApprovalsView() {
         } else {
           await rejectApproval(approval.approval_id);
         }
-        setApprovals((current) =>
-          current.filter((a) => a.approval_id !== approval.approval_id),
-        );
         showNotice({
           kind: "success",
-          text: `${approval.approval_id} (${approval.action}) was ${decision === "approve" ? "approved" : "rejected"}.`,
+          text: `${approval.approval_id} (${approval.action}) was ${decision === "approve" ? "approved — it now waits for an explicit Execute" : "rejected"}.`,
         });
+        await refresh();
       } catch (caught) {
         if (caught instanceof ApiError && caught.status === 404) {
-          // Someone else decided or removed it — drop it from the list.
-          setApprovals((current) =>
-            current.filter((a) => a.approval_id !== approval.approval_id),
-          );
+          // Someone else decided or removed it — refresh the truth.
+          await refresh();
           showNotice({
             kind: "warning",
-            text: `${approval.approval_id} was not found on the backend and has been removed from the list.`,
+            text: `${approval.approval_id} was not found on the backend; the list has been refreshed.`,
           });
         } else if (caught instanceof ApiError && caught.status === 409) {
           showNotice({
@@ -165,11 +168,69 @@ export function ApprovalsView() {
     [refresh, showNotice],
   );
 
+  const execute = useCallback(
+    async (approval: Approval) => {
+      setExecutingId(approval.approval_id);
+      try {
+        const finished = await executeApproval(approval.approval_id);
+        if (finished.status === "executed") {
+          showNotice({
+            kind: "success",
+            text: `${approval.approval_id} (${approval.action}) was executed.`,
+          });
+        } else {
+          // The request succeeded; the action itself was refused.
+          showNotice({
+            kind: "error",
+            text: `${approval.approval_id} (${approval.action}) failed: ${finished.execution_error ?? "the action was refused"}`,
+          });
+        }
+        await refresh();
+      } catch (caught) {
+        if (caught instanceof ApiError && caught.status === 409) {
+          showNotice({
+            kind: "warning",
+            text: `${approval.approval_id} was not executed again: ${caught.message}`,
+          });
+          await refresh();
+        } else if (caught instanceof ApiError && caught.status === 404) {
+          await refresh();
+          showNotice({
+            kind: "warning",
+            text: `${approval.approval_id} was not found on the backend; the list has been refreshed.`,
+          });
+        } else {
+          showNotice({
+            kind: "error",
+            text:
+              caught instanceof Error
+                ? caught.message
+                : "The action could not be executed.",
+          });
+        }
+      } finally {
+        setExecutingId(null);
+      }
+    },
+    [refresh, showNotice],
+  );
+
+  const pending = approvals.filter((a) => a.status === "pending");
+  const awaitingExecution = approvals.filter(
+    (a) => a.status === "approved" || a.status === "executing",
+  );
+  const history = approvals.filter(
+    (a) =>
+      a.status === "executed" ||
+      a.status === "failed" ||
+      a.status === "rejected",
+  );
+
   return (
     <div className="mx-auto w-full max-w-5xl flex-1 overflow-y-auto px-4 py-8 sm:px-6 lg:px-8">
       <PageHeader
         title="Approvals"
-        description="Sensitive actions requested by the assistant — refunds, order cancellations, bulk stock updates — wait here for a human decision before anything is executed."
+        description="Sensitive actions requested by the assistant — refunds, order cancellations, bulk stock updates — wait here for a human decision, and only then for an explicit Execute."
         actions={
           <button
             type="button"
@@ -190,8 +251,9 @@ export function ApprovalsView() {
         <IconShield className="mt-0.5 h-4.5 w-4.5 shrink-0 text-indigo-500" />
         <p className="leading-relaxed">
           The AI assistant never executes sensitive actions on its own. When it
-          needs one, a request appears here; approving or rejecting records
-          your decision via the approval API.
+          needs one, a request appears here. Approving records your decision
+          only — the action runs when you press Execute, exactly once, from
+          the details captured at request time.
         </p>
       </div>
 
@@ -204,8 +266,6 @@ export function ApprovalsView() {
         >
           {notice.kind === "success" ? (
             <IconCheck className="mt-0.5 h-4 w-4 shrink-0" />
-          ) : notice.kind === "warning" ? (
-            <IconAlert className="mt-0.5 h-4 w-4 shrink-0" />
           ) : (
             <IconAlert className="mt-0.5 h-4 w-4 shrink-0" />
           )}
@@ -245,32 +305,84 @@ export function ApprovalsView() {
         </div>
       )}
 
-      {/* List */}
       {!initialLoading && !loadError && approvals.length === 0 && (
         <div className="mt-6">
           <EmptyState
             icon={<IconInbox className="h-6 w-6" />}
-            title="No pending approvals"
+            title="No approvals"
             description="Approvals appear here when the assistant requests a sensitive action — for example when you ask it to refund an order, cancel an order, or update stock in bulk."
           />
         </div>
       )}
 
-      {!initialLoading && !loadError && approvals.length > 0 && (
-        <div className="mt-6 space-y-4">
-          <p className="text-xs font-medium text-slate-500">
-            {approvals.length} pending
-          </p>
-          {approvals.map((approval) => (
-            <ApprovalCard
-              key={approval.approval_id}
-              approval={approval}
-              deciding={
-                deciding?.id === approval.approval_id ? deciding.decision : null
-              }
-              onDecide={(a, decision) => void decide(a, decision)}
-            />
-          ))}
+      {!initialLoading && !loadError && (
+        <div className="mt-6 space-y-8">
+          {/* Awaiting decision */}
+          {pending.length > 0 && (
+            <section aria-label="Awaiting decision">
+              <p className="text-xs font-medium text-slate-500">
+                {pending.length} awaiting decision
+              </p>
+              <div className="mt-3 space-y-4">
+                {pending.map((approval) => (
+                  <ApprovalCard
+                    key={approval.approval_id}
+                    approval={approval}
+                    deciding={
+                      deciding?.id === approval.approval_id
+                        ? deciding.decision
+                        : null
+                    }
+                    executing={executingId === approval.approval_id}
+                    onDecide={(a, decision) => void decide(a, decision)}
+                    onExecute={(a) => void execute(a)}
+                  />
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* Approved — awaiting execution */}
+          {awaitingExecution.length > 0 && (
+            <section aria-label="Awaiting execution">
+              <p className="text-xs font-medium text-slate-500">
+                {awaitingExecution.length} approved — awaiting execution
+              </p>
+              <div className="mt-3 space-y-4">
+                {awaitingExecution.map((approval) => (
+                  <ApprovalCard
+                    key={approval.approval_id}
+                    approval={approval}
+                    deciding={null}
+                    executing={executingId === approval.approval_id}
+                    onDecide={(a, decision) => void decide(a, decision)}
+                    onExecute={(a) => void execute(a)}
+                  />
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* History */}
+          {history.length > 0 && (
+            <section aria-label="Execution history">
+              <p className="text-xs font-medium text-slate-500">
+                {history.length} finished
+              </p>
+              <div className="mt-3 space-y-4">
+                {history.map((approval) => (
+                  <ApprovalCard
+                    key={approval.approval_id}
+                    approval={approval}
+                    deciding={null}
+                    executing={false}
+                    onDecide={(a, decision) => void decide(a, decision)}
+                    onExecute={(a) => void execute(a)}
+                  />
+                ))}
+              </div>
+            </section>
+          )}
         </div>
       )}
     </div>

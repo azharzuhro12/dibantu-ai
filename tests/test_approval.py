@@ -1,9 +1,15 @@
-"""Offline tests for the human-in-the-loop approval system (Step 8).
+"""Tests for the human-in-the-loop approval system (Step 8 → Step 13).
 
-Three groups: the in-memory approval manager, the central interception
-inside the Agent tool-dispatch path (driven by a fake GLM client, no
-network), and the approval API endpoints. The mock store and the
-approval store are reset around every test.
+Three groups: the approval manager (now backed by the ``approvals``
+PostgreSQL table via the scratch test database), the central
+interception inside the Agent tool-dispatch path (driven by a fake GLM
+client, no network), and the approval API endpoints. The mock store
+and the approval store are reset around every test.
+
+Step 13 note: the ``Approval`` objects returned by the manager are now
+immutable snapshots of database rows, so tests assert field equality
+(``==``) instead of object identity (``is``), and re-fetch a record to
+observe a decision made after the snapshot was taken.
 """
 
 from __future__ import annotations
@@ -82,8 +88,9 @@ def test_create_and_get_approval() -> None:
     assert approval.status == "pending"
     assert approval.created_at
     assert approval.decided_at is None
-    assert get_approval(approval.approval_id) is approval
-    assert get_pending_approval(approval.approval_id) is approval
+    # Snapshots now come from the database: same record, field-equal.
+    assert get_approval(approval.approval_id) == approval
+    assert get_pending_approval(approval.approval_id) == approval
 
 
 def test_create_rejects_non_sensitive_actions() -> None:
@@ -135,7 +142,8 @@ def test_cannot_approve_rejected_approval() -> None:
 
     with pytest.raises(ApprovalError):
         approve(approval.approval_id)
-    assert approval.status == "rejected"  # unchanged
+    # Decision unchanged in the store (re-fetch: snapshots are immutable).
+    assert get_approval(approval.approval_id).status == "rejected"
 
 
 def test_cannot_reject_approved_approval() -> None:
@@ -144,7 +152,7 @@ def test_cannot_reject_approved_approval() -> None:
 
     with pytest.raises(ApprovalError):
         reject(approval.approval_id)
-    assert approval.status == "approved"  # unchanged
+    assert get_approval(approval.approval_id).status == "approved"
 
 
 def test_unknown_approval_not_found() -> None:
@@ -387,7 +395,7 @@ def test_api_reject_then_approve_conflicts() -> None:
 
     assert api_decide(approval.approval_id, "reject").status_code == 200
     assert api_decide(approval.approval_id, "approve").status_code == 409
-    assert approval.status == "rejected"  # decision unchanged
+    assert get_approval(approval.approval_id).status == "rejected"
 
 
 def test_agent_created_approval_flows_through_api() -> None:
