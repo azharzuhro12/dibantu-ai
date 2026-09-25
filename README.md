@@ -4,6 +4,27 @@
 
 Masalah yang dipecahkan: pemilik usaha kecil tidak butuh aplikasi kasir kompleks — mereka butuh asisten yang bisa diajak chat dan langsung mengoperasikan data bisnis mereka dengan aman (stok tidak pernah bocor/oversell, aksi sensitif butuh persetujuan manusia).
 
+## Daftar Isi
+
+1. [Fitur Utama](#fitur-utama)
+2. [Arsitektur & Alur Agent](#arsitektur--alur-agent)
+3. [Tech Stack](#tech-stack)
+4. [Menjalankan dengan Docker](#menjalankan-dengan-docker-cara-utama)
+5. [Menjalankan Frontend](#menjalankan-frontend)
+6. [Menjalankan Backend Tanpa Docker](#menjalankan-backend-tanpa-docker)
+7. [Contoh Penggunaan](#contoh-penggunaan)
+8. [Environment Variables](#environment-variables)
+9. [API](#api)
+10. [Database](#database)
+11. [RAG / Knowledge Base (Step 12)](#rag--knowledge-base-step-12)
+12. [Approval Persisten (Step 13)](#approval-persisten-step-13)
+13. [Human-in-the-Loop Approval Execution (Step 16)](#human-in-the-loop-approval-execution-step-16)
+14. [Agent Memory (Step 14)](#agent-memory-step-14)
+15. [Observability (Step 15)](#observability-step-15)
+16. [Testing & Evaluation](#testing--evaluation)
+17. [Struktur Project](#struktur-project)
+18. [Status & Limitations](#status--limitations)
+
 ## Fitur Utama
 
 - **Chat agent dengan tool calling** — agent memanggil business tools (stok, order, customer, laporan) lewat loop GLM; tidak pernah mengarang data bisnis.
@@ -19,16 +40,22 @@ Masalah yang dipecahkan: pemilik usaha kecil tidak butuh aplikasi kasir kompleks
 ## Arsitektur & Alur Agent
 
 ```
-Pesan user → FastAPI /api/chat → Agent loop
-  → GLM (endpoint Anthropic-compatible z.ai, model glm-5.3)
-  → tool_use → registry ─┬→ business tools → PostgreSQL   (data live)
-  │                       └→ search_knowledge_base → ChromaDB (kebijakan)
-  → tool_result → GLM → jawaban final
+Pesan user → FastAPI /api/chat / webhook WhatsApp → DibantuAgent
+  → memori owner: ≤3 fakta relevan di-inject ke system prompt (Step 14)
+  → Agent loop (maks 5 eksekusi tool per request)
+      → GLM (endpoint Anthropic-compatible z.ai, model glm-5.3)
+      → tool_use ─┬→ business tools ────────→ PostgreSQL    (stok/order/customer/laporan)
+      │           ├→ memory tools ─────────→ agent_memories (fakta per owner)
+      │           ├→ search_knowledge_base → ChromaDB       (kebijakan, ber-sitasi)
+      │           └→ aksi sensitif ─────────→ INTERSEP: buat approval pending (Step 8/13)
+      → tool_result → GLM → jawaban final (+ run_id)
+  → manusia approve → klik Execute → executor allowlist → satu transaksi (Step 16)
+  → semua operasi ditrace → agent_runs / agent_events, metadata aman (Step 15)
 ```
 
 - Agent loop maksimal 5 eksekusi tool per request (mencegah loop tanpa batas).
 - Tool yang tidak dikenal atau gagal mengembalikan `{"error": ...}` ke model — bukan crash.
-- Aksi sensitif diintersepsi **sebelum** eksekusi dan menjadi pending approval.
+- Aksi sensitif diintersepsi **sebelum** eksekusi dan menjadi pending approval — tidak pernah dispatchable.
 - Jawaban di-grounding ke hasil tool: skenario evaluasi memverifikasi setiap fakta dalam jawaban benar-benar berasal dari tool result.
 
 ## Tech Stack
@@ -84,11 +111,11 @@ cp frontend/.env.local.example frontend/.env.local
 
 | Halaman | Data |
 | --- | --- |
-| **Chat** | `POST /api/chat` — loading, error, dan retry per pesan. |
-| **Inventory** | Lewat assistant (`/api/chat`); placeholder untuk endpoint khusus masa depan. |
-| **Orders** | Lewat assistant; placeholder endpoint masa depan. |
-| **Reports** | Laporan on-demand dari assistant; placeholder API tersimpan. |
-| **Approvals** | `GET /api/approvals` + approve/reject, lengkap penanganan 404/409. |
+| **Chat** | `POST /api/chat` — loading, error, dan retry per pesan; badge status koneksi backend. |
+| **Inventory / Orders / Reports** | Lewat assistant (`/api/chat`); placeholder untuk endpoint khusus masa depan. |
+| **Approvals** | Lifecycle penuh: `GET /api/approvals?status=all`, approve/reject, tombol **Execute** (Step 16), badge 6 status, panel hasil/error eksekusi, penanganan 404/409 + polling 30 detik. |
+| **Memory** (Step 14) | `GET/DELETE /api/memory` per owner — daftar, hapus, ganti owner. |
+| **Observability** (Step 15) | `GET /api/observability/runs` + timeline event per run, filter status. |
 
 ## Menjalankan Backend Tanpa Docker
 
@@ -104,6 +131,33 @@ docker compose up -d postgres # Postgres tetap via compose
 uvicorn app.main:app --reload --port 8090
 python -m app.rag.ingest      # ingest knowledge base (sekali; download model pertama kali)
 ```
+
+## Contoh Penggunaan
+
+```bash
+# 1. Chat: buat pesanan (agent memanggil create_order → PostgreSQL, stok terpotong atomik)
+curl -s -X POST http://localhost:8090/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Budi Santoso pesan 2 kopi susu."}'
+
+# 2. Chat: minta aksi sensitif → TIDAK dieksekusi, menjadi approval pending
+curl -s -X POST http://localhost:8090/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Refund pesanan ORD-0004."}'
+
+# 3. Manusia memutuskan, lalu mengeksekusi — tepat sekali
+curl -X POST http://localhost:8090/api/approvals/apr-XXXXXXXXXXXX/approve
+curl -X POST http://localhost:8090/api/approvals/apr-XXXXXXXXXXXX/execute   # → executed
+curl -X POST http://localhost:8090/api/approvals/apr-XXXXXXXXXXXX/execute   # → 409 conflict
+
+# 4. Lihat trace run eksekusi tadi (event APPROVAL_EXECUTING → APPROVAL_EXECUTED)
+curl -s "http://localhost:8090/api/observability/runs?source=approval_executor&limit=1"
+
+# 5. Refund parsial: kirim amount lewat chat ("Refund 20000 dari ORD-0003")
+#    → uang saja (refunded_amount kumulatif), stok tidak kembali, order tetap completed
+```
+
+Semua alur di atas juga tersedia dari halaman **Approvals** di frontend (approve → tombol Execute → hasil/error tampil di kartu).
 
 ## Environment Variables
 
@@ -128,7 +182,7 @@ python -m app.rag.ingest      # ingest knowledge base (sekali; download model pe
 | --- | --- | --- |
 | GET | `/health` | Health check / liveness probe. |
 | GET | `/docs` | Swagger UI (OpenAPI). |
-| POST | `/api/chat` | Chat dengan agent (tool calling). |
+| POST | `/api/chat` | Chat dengan agent (tool calling; `owner_key` opsional di body untuk memori per-owner, default `"default"`). |
 | POST | `/webhook/whatsapp` | Simulator webhook WhatsApp (lokal, tanpa Meta). |
 | GET | `/api/approvals` | Daftar approval (default: pending; `?status=approved\|rejected\|executing\|executed\|failed\|all` untuk lifecycle penuh). |
 | POST | `/api/approvals/{id}/approve` | Setujui approval (opsional `?reason=...`, maks 500 karakter) — hanya mencatat keputusan. |
@@ -221,7 +275,7 @@ Jaminan keamanan yang dipertahankan:
 - Transisi status invalid ditolak: `approved → rejected`, `rejected → approved`, dan keputusan ulang semuanya 409; id yang tidak ada 404.
 - Payload approval disimpan untuk direview manusia — berisi parameter aksi bisnis, bukan kredensial.
 
-**Limitasi (sama seperti Step 8, kini persisten):** approve hanya mencatat keputusan — tidak ada eksekusi refund/pembatalan yang dijadwalkan ulang setelah approval (deferred execution belum diimplementasikan). Endpoint approval juga belum memakai autentikasi.
+**Eksekusi:** approve memang hanya mencatat keputusan — eksekusi eksplisit ditambahkan di [Step 16](#human-in-the-loop-approval-execution-step-16) (executor allowlist, claim atomik, idempoten). Endpoint approval juga belum memakai autentikasi.
 
 ## Human-in-the-Loop Approval Execution (Step 16)
 
@@ -258,7 +312,7 @@ user minta aksi sensitif
 - **Observability** — tiap eksekusi membentuk satu trace run (`source=approval_executor`): `APPROVAL_EXECUTING` → `APPROVAL_EXECUTED`/`APPROVAL_FAILED` (+ RUN_STARTED/COMPLETED), metadata aman hanya `{approval_id, action, status}` — payload tidak pernah masuk trace. Kegagalan tracing ditelan; tidak pernah menggagalkan eksekusi.
 - **Persisten** — status, timestamps, result, dan error eksekusi tersimpan di PostgreSQL; selamat dari restart (diverifikasi live).
 
-**Batasan (jujur):** approval `executing` bisa **stuck** jika proses mati setelah claim sebelum tulis status terminal (belum ada mekanisme recovery/re-scan); `failed` terminal tanpa explicit retry design (buat approval baru untuk mencoba lagi); endpoint approval **belum ada autentikasi/otorisasi** (siapa pun yang bisa memanggil API bisa approve/execute); eksekusi **tidak pernah otomatis oleh agent** (by design); dan batas aksi sensitif Step 8 yang masih berlaku: perubahan stok beberapa produk bisa "melewati" approval `bulk_stock_update` lewat beberapa kali `update_stock` reguler — agent dilarang lewat deskripsi tool, tapi tidak dicegah secara struktural.
+**Batasan (jujur):** approval `executing` bisa **stuck** jika proses mati setelah claim sebelum tulis status terminal (belum ada mekanisme recovery/re-scan); `failed` terminal tanpa explicit retry design (buat approval baru untuk mencoba lagi); endpoint approval **belum ada autentikasi/otorisasi** (siapa pun yang bisa memanggil API bisa approve/execute); eksekusi **tidak pernah otomatis oleh agent** (by design); batas aksi sensitif Step 8 yang masih berlaku: perubahan stok beberapa produk bisa "melewati" approval `bulk_stock_update` lewat beberapa kali `update_stock` reguler — agent dilarang lewat deskripsi tool, tapi tidak dicegah secara struktural; dan edge case yang diketahui dari audit final: **cancel atas order yang sudah pernah direfund parsial** mengurangi `total_spent` sebesar total penuh (kredit ganda pada agregat customer saja — stok/laporan tidak terpengaruh; belum diperbaiki, fix-nya menunggu follow-up).
 
 ## Agent Memory (Step 14)
 
@@ -281,7 +335,7 @@ request (owner_key)
 
 **Keamanan:** memori murni konteks — tidak ada jalur dari memori ke eksekusi aksi bisnis, modifikasi order/stok, RAG, atau approval. Memori dan knowledge base tetap konsep terpisah.
 
-**Batasan:** belum ada autentikasi (owner_key bisa diklaim siapa saja yang bisa memanggil API — sama seperti endpoint lain di proyek ini); retrieval keyword saja (bukan semantik); tidak ada UI untuk mengedit memori (hanya lihat/hapus).
+**Batasan:** belum ada autentikasi (owner_key bisa diklaim siapa saja yang bisa memanggil API — sama seperti endpoint lain di proyek ini); retrieval keyword saja (bukan semantik); tidak ada UI untuk mengedit memori (hanya lihat/hapus); dan layar rahasia menangkap pola umum (password/api key/token/nomor kartu) tetapi belum semua bentuk rahasia — mis. prefiks `sk-`/`ghp_`/`AKIA` atau passphrase tanpa label masih lolos (temuan audit final, follow-up).
 
 ## Observability (Step 15)
 
@@ -296,14 +350,14 @@ Setiap eksekusi agent ditrace **end-to-end** di dua tabel PostgreSQL (migration 
 
 **Usage token** (`input_tokens`/`output_tokens`) diambil dari respons provider saat ada (tidak pernah dikarang) dan hanya masuk metadata observability. Keputusan approve/reject juga ditrace (informasional — tidak mengeksekusi apa pun).
 
-**Batasan:** tracing level operasi (bukan baris-per-baris audit log); belum ada agregat/metric (mis. token per hari); retention/retensi data run belum diatur (tabel tumbuh sampai dibersihkan manual); endpoint observability belum memakai autentikasi.
+**Batasan:** tracing level operasi (bukan baris-per-baris audit log); belum ada agregat/metric (mis. token per hari); retention/retensi data run belum diatur (tabel tumbuh sampai dibersihkan manual); endpoint observability belum memakai autentikasi; dan bila penyimpanan run gagal total (DB down), response tetap membawa `run_id` yang tak pernah tersimpan — pencarian run tersebut akan 404 (temuan audit final, follow-up).
 
 ## Testing & Evaluation
 
 ```bash
 docker compose up -d postgres   # test database butuh Postgres
 source .venv/bin/activate
-pytest -q                       # 350 test (+1 skip)
+pytest -q                       # 350 test (349 lulus + 1 skip kondisional)
 python -m evaluation.evaluator  # 52 skenario
 ```
 
@@ -316,15 +370,15 @@ python -m evaluation.evaluator  # 52 skenario
 ```
 dibantu-ai/
 ├── app/
-│   ├── agent/          # Agent loop + GLM client
-│   ├── api/            # Routes (chat, webhook, approvals, knowledge, memory)
-│   ├── approval/       # Human-in-the-loop approval store (persisten)
+│   ├── agent/          # Agent loop + GLM client + DibantuAgent (memori & trace)
+│   ├── api/            # Routes (chat, webhook, approvals, knowledge, memory, observability)
+│   ├── approval/       # Approval store persisten + executor allowlist (Step 13/16)
 │   ├── db/             # Engine/session, models, repository, seed
-│   ├── memory/         # Agent memory: repository, manager, tools
+│   ├── memory/         # Agent memory per owner: repository, manager, tools (Step 14)
 │   ├── models/         # Schema Pydantic
-│   ├── observability/  # Tracing run/event: manager, repository (PostgreSQL-only)
+│   ├── observability/  # Tracing run/event: manager, repository (Step 15)
 │   ├── rag/            # RAG: chunker, embeddings, vector store, retriever, service, tool, CLI
-│   └── tools/          # Business tools + registry
+│   └── tools/          # Business tools + registry + sensitive actions (Step 16)
 ├── alembic/            # Migration database
 ├── data/
 │   ├── knowledge/      # Dokumen kebijakan Markdown (demo)
@@ -339,10 +393,23 @@ dibantu-ai/
 
 ## Status & Limitations
 
-🚧 **Step 16: Human-in-the-Loop Approval Execution — selesai.** Step 1–15 tetap utuh, ditambah state machine approval 6-status (migration `0005`), implementasi transaksional nyata untuk tiga aksi sensitif (`app/tools/sensitive_actions.py`: refund penuh/parsial, cancel order, bulk stock update), executor allowlist dengan claim atomik `approved → executing` di database (autoritas concurrency, bukan lock in-process), endpoint `POST /api/approvals/{id}/execute` tanpa argumen (payload snapshot immutable), tombol Execute + badge status di halaman Approvals frontend, dan trace khusus per eksekusi (`source=approval_executor`). Eksekusi tepat sekali by construction; approve tetap hanya mencatat keputusan.
+✅ **Step 1–16 selesai dan ter-audit** — 349 test lulus (+1 skip kondisional), evaluasi 52/52, lint+build frontend bersih, Docker healthy, migration `0005` applied, alur approval→execute terverifikasi live (termasuk uji race konkurensi sungguhan via `threading.Barrier`).
 
-Riwayat langkah sebelumnya: Step 15 menambah observability end-to-end (`agent_runs`/`agent_events`, `run_id` stabil, halaman Observability); Step 14 memori persisten per owner; Step 13 approval persisten; Step 12 RAG knowledge base; Step 11 PostgreSQL; Step 8 approval human-in-the-loop; Step 6 evaluation suite.
+| Step | Deliverable |
+| --- | --- |
+| 1–2 | Setup proyek + chat GLM dasar (custom agent loop, tanpa LangChain) |
+| 3–5 | Business tools (stok/order/customer/laporan) + tool-calling loop + multi-step workflow |
+| 6 | Evaluation suite deterministik (offline, 52 skenario) |
+| 7 | WhatsApp webhook simulator (lokal) |
+| 8 | Human-in-the-loop approval (intersepsi aksi sensitif) |
+| 9–10 | Dockerisasi + dashboard Next.js |
+| 11 | PostgreSQL persistence (Alembic, transaksi atomik, seed idempotent) |
+| 12 | RAG knowledge base (ChromaDB + embeddings lokal, ber-sitasi) |
+| 13 | Approval persisten (keputusan atomik di database) |
+| 14 | Agent memory persisten per owner (layar rahasia, isolasi) |
+| 15 | Observability end-to-end (`run_id` stabil, metadata aman by construction) |
+| 16 | Deferred approval execution (allowlist executor, claim atomik, idempoten, refund penuh/parsial) |
 
-Belum diimplementasikan: WhatsApp Cloud API sungguhan (Meta auth + verifikasi signature), tunnel ngrok, integrasi Google Sheets, autentikasi, dan deployment. Endpoint inventory/orders/reports khusus belum ada — halaman frontend terkait masih lewat assistant.
+Belum diimplementasikan (backlog yang disengaja): WhatsApp Cloud API sungguhan (Meta auth + verifikasi signature), tunnel ngrok, integrasi Google Sheets, autentikasi, dan deployment. Endpoint inventory/orders/reports khusus belum ada — halaman frontend terkait masih lewat assistant.
 
-Limitasi RAG saat ini: tidak ada UI manajemen dokumen (tambah/ubah dokumen = edit file + re-ingest); dokumen yang dihapus dari `data/knowledge/` tidak otomatis menghapus chunk lama di store (re-ingest dokumen berubah sudah ditangani); belum ada re-ranking maupun filter similarity threshold (relevansi dinilai GLM dari passage yang kembali); embedding model default berbahasa Inggris — dokumen Indonesia tetap ter-retrieve dengan baik lewat overlap kosakata, tapi model multibahasa (mis. `paraphrase-multilingual-MiniLM`) bisa lebih akurat dan tinggal ganti `RAG_EMBEDDING_MODEL` + hapus `data/rag/` + re-ingest.
+Limitasi per fitur (jujur dan lengkap) didokumentasikan di masing-masing section di atas. Limitasi RAG: tidak ada UI manajemen dokumen (tambah/ubah dokumen = edit file + re-ingest); dokumen yang dihapus dari `data/knowledge/` tidak otomatis menghapus chunk lama di store (re-ingest dokumen berubah sudah ditangani); belum ada re-ranking maupun filter similarity threshold (relevansi dinilai GLM dari passage yang kembali); embedding model default berbahasa Inggris — dokumen Indonesia tetap ter-retrieve dengan baik lewat overlap kosakata, tapi model multibahasa (mis. `paraphrase-multilingual-MiniLM`) bisa lebih akurat dan tinggal ganti `RAG_EMBEDDING_MODEL` + hapus `data/rag/` + re-ingest.
