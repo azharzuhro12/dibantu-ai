@@ -59,7 +59,9 @@ function formatDuration(ms: number | null): string {
 
 function eventSummary(event: AgentEvent): string {
   const meta = event.metadata ?? {};
-  const tool = typeof meta.tool_name === "string" ? meta.tool_name : null;
+  // Tool events carry {"tool": name} (see observability manager); LLM
+  // events carry {"model": ...} with the token counts.
+  const tool = typeof meta.tool === "string" ? meta.tool : null;
   const model = typeof meta.model === "string" ? meta.model : null;
   const parts = [event.event_name];
   if (tool) {

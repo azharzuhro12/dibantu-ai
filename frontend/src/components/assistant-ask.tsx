@@ -1,10 +1,11 @@
 "use client";
 
 /**
- * Reusable "ask the assistant" panel. Inventory, Orders, and Reports
- * have no dedicated backend endpoints yet — their data lives behind
- * the AI agent — so these pages query the real assistant through
- * POST /api/chat instead of showing fabricated tables.
+ * Reusable "ask the assistant" panel. The dashboard pages read their
+ * tables from dedicated read-only endpoints (GET /api/inventory,
+ * /api/orders, /api/reports); this panel complements them with the
+ * conversational route — actions and narrative answers through
+ * POST /api/chat.
  *
  * The panel is explicitly labeled as AI answers, never as live
  * database records. Parents that need to trigger a question
