@@ -5,6 +5,7 @@ Step 12; approvals persisted to PostgreSQL, Step 13; persistent agent
 memory endpoints, Step 14; deferred approval execution endpoint, Step 16)."""
 
 from dataclasses import asdict
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
@@ -46,6 +47,13 @@ from app.models.schemas import (
     MemoryCreateRequest,
     MemoryListResponse,
     MemoryResponse,
+    OrderCustomerResponse,
+    OrderItemResponse,
+    OrderListResponse,
+    OrderResponse,
+    OrderStatusSummaryResponse,
+    ReportWindowResponse,
+    ReportsResponse,
     WhatsAppWebhookRequest,
     WhatsAppWebhookResponse,
 )
@@ -583,4 +591,111 @@ async def get_inventory() -> InventoryListResponse:
             for product in products
         ],
         count=len(products),
+    )
+
+
+@router.get(
+    "/api/orders",
+    response_model=OrderListResponse,
+    tags=["orders"],
+)
+async def get_orders() -> OrderListResponse:
+    """Read-only order history for the dashboard table.
+
+    Lists every order straight from PostgreSQL through the shared
+    repository — the same rows the ``create_order`` tool writes and the
+    sales report reads — newest first, with the customer info and each
+    line's priced snapshot (product name, quantity, unit price,
+    subtotal). No LLM, no tool calling; read-only.
+    """
+    try:
+        with database.session_scope() as session:
+            orders = repository.list_orders(session)
+    except SQLAlchemyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Orders are unavailable (database error).",
+        ) from exc
+    return OrderListResponse(
+        orders=[
+            OrderResponse(
+                order_id=order.id,
+                customer=(
+                    OrderCustomerResponse(
+                        name=order.customer.name,
+                        phone=order.customer.phone,
+                        email=order.customer.email,
+                    )
+                    if order.customer is not None
+                    else None
+                ),
+                items=[
+                    OrderItemResponse(
+                        product_name=item.product_name,
+                        quantity=item.quantity,
+                        unit_price=money(item.unit_price),
+                        line_total=money(item.line_total),
+                    )
+                    for item in order.items
+                ],
+                total_price=money(order.total_price),
+                status=order.status,
+                created_at=order.created_at.isoformat(timespec="seconds"),
+            )
+            for order in orders
+        ],
+        count=len(orders),
+    )
+
+
+#: Rolling windows reported by GET /api/reports — the same periods (and
+#: day lengths) the ``get_sales_report`` tool serves, so the report
+#: cards and a chat answer can never disagree.
+_REPORT_WINDOWS: tuple[tuple[str, int], ...] = (
+    ("daily", 1),
+    ("weekly", 7),
+    ("monthly", 30),
+)
+
+
+@router.get(
+    "/api/reports",
+    response_model=ReportsResponse,
+    tags=["reports"],
+)
+async def get_reports() -> ReportsResponse:
+    """Read-only sales report for the dashboard.
+
+    Aggregates straight from PostgreSQL through the shared repository —
+    the same ``sales_window`` computation the ``get_sales_report`` tool
+    runs (completed orders only; refunded/cancelled excluded because
+    their stock was restored and revenue undone) — for the daily,
+    weekly, and monthly rolling windows, plus a count of orders per
+    status across the whole table. No LLM, no tool calling; read-only.
+    """
+    now = datetime.now()
+    try:
+        with database.session_scope() as session:
+            status_counts = dict(repository.count_orders_by_status(session))
+            windows = [
+                ReportWindowResponse(
+                    period=period,
+                    window_days=window_days,
+                    **repository.sales_window(
+                        session, now=now, window_days=window_days
+                    ),
+                )
+                for period, window_days in _REPORT_WINDOWS
+            ]
+    except SQLAlchemyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Reports are unavailable (database error).",
+        ) from exc
+    return ReportsResponse(
+        generated_at=now.isoformat(timespec="seconds"),
+        status_summary=OrderStatusSummaryResponse(
+            by_status=status_counts, total=sum(status_counts.values())
+        ),
+        windows=windows,
     )

@@ -201,6 +201,24 @@ def order_as_dict(order: Order) -> dict[str, Any]:
     }
 
 
+def list_orders(session: Session) -> list[Order]:
+    """All orders, newest first — read-only listing for the dashboard.
+
+    Customer and items are eager-loaded (``selectinload``) so the caller
+    can serialize an order without triggering lazy loads after the
+    session-scope query. Ties on ``created_at`` (second precision) break
+    on the ``ORD-####`` id, descending, keeping the newest-first order
+    deterministic.
+    """
+    return list(
+        session.scalars(
+            select(Order)
+            .options(selectinload(Order.customer), selectinload(Order.items))
+            .order_by(Order.created_at.desc(), Order.id.desc())
+        )
+    )
+
+
 def orders_since(session: Session, cutoff: datetime) -> list[Order]:
     """Completed orders created at/after ``cutoff``, oldest first.
 
@@ -222,6 +240,21 @@ def orders_since(session: Session, cutoff: datetime) -> list[Order]:
 # ---------------------------------------------------------------------------
 # Reports
 # ---------------------------------------------------------------------------
+
+
+def count_orders_by_status(session: Session) -> list[tuple[str, int]]:
+    """(status, count) pairs across ALL orders — read-only breakdown.
+
+    Every status present in the table is returned, grouped by the
+    database itself; the report endpoint reports them as-is rather
+    than assuming a fixed set of statuses.
+    """
+    return [
+        (status, count)
+        for status, count in session.execute(
+            select(Order.status, func.count()).group_by(Order.status)
+        )
+    ]
 
 
 def sales_window(

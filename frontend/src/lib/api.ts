@@ -9,6 +9,8 @@
  *   GET  /health
  *   POST /api/chat
  *   GET  /api/inventory
+ *   GET  /api/orders
+ *   GET  /api/reports
  *   GET  /api/approvals
  *   POST /api/approvals/{id}/approve
  *   POST /api/approvals/{id}/reject
@@ -245,6 +247,80 @@ export interface InventoryListResponse {
  */
 export function getInventory(): Promise<InventoryListResponse> {
   return request<InventoryListResponse>("/api/inventory");
+}
+
+/** Customer block embedded in an order row. */
+export interface OrderCustomer {
+  name: string;
+  phone: string | null;
+  email: string | null;
+}
+
+/** One order line with its priced snapshot (GET /api/orders). */
+export interface OrderItem {
+  product_name: string;
+  quantity: number;
+  unit_price: number;
+  line_total: number;
+}
+
+/** One order row from GET /api/orders (read-only PostgreSQL data). */
+export interface Order {
+  order_id: string;
+  customer: OrderCustomer | null;
+  items: OrderItem[];
+  total_price: number;
+  status: string;
+  created_at: string;
+}
+
+export interface OrderListResponse {
+  orders: Order[];
+  count: number;
+}
+
+/**
+ * GET /api/orders — every order straight from PostgreSQL, the same
+ * source of truth the create_order tool writes. Items carry the priced
+ * snapshot stored at creation, so the table and a chat answer can
+ * never disagree.
+ */
+export function getOrders(): Promise<OrderListResponse> {
+  return request<OrderListResponse>("/api/orders");
+}
+
+/** One rolling sales window from GET /api/reports. */
+export interface ReportWindow {
+  period: string;
+  window_days: number;
+  total_orders: number;
+  total_items_sold: number;
+  total_revenue: number;
+  products_sold: Record<string, number>;
+  top_product: string | null;
+}
+
+/** Order counts by status, as stored in the database. */
+export interface OrderStatusSummary {
+  by_status: Record<string, number>;
+  total: number;
+}
+
+/** Response of GET /api/reports (read-only PostgreSQL aggregates). */
+export interface ReportsResponse {
+  generated_at: string;
+  status_summary: OrderStatusSummary;
+  windows: ReportWindow[];
+}
+
+/**
+ * GET /api/reports — daily/weekly/monthly sales aggregates straight
+ * from PostgreSQL, the same sales_window computation the
+ * get_sales_report tool runs, plus order counts per status. Numbers
+ * here and a chat answer can never disagree.
+ */
+export function getReports(): Promise<ReportsResponse> {
+  return request<ReportsResponse>("/api/reports");
 }
 
 /** Statuses GET /api/approvals?status= accepts ("all" = every approval). */

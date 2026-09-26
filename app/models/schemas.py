@@ -331,3 +331,105 @@ class InventoryListResponse(BaseModel):
         default_factory=list, description="Every product, in catalog order."
     )
     count: int = Field(..., description="Number of products returned.")
+
+
+class OrderCustomerResponse(BaseModel):
+    """Customer block embedded in an order row (GET /api/orders)."""
+
+    name: str = Field(..., description="Customer display name.")
+    phone: str | None = Field(None, description="Phone number, when known.")
+    email: str | None = Field(None, description="Email address, when known.")
+
+
+class OrderItemResponse(BaseModel):
+    """One order line for GET /api/orders — the priced snapshot stored
+    on the row at creation time (name and price never drift with later
+    catalog edits)."""
+
+    product_name: str = Field(..., description="Product name as ordered.")
+    quantity: int = Field(..., description="Units ordered.")
+    unit_price: int | float = Field(..., description="Unit price (IDR).")
+    line_total: int | float = Field(
+        ..., description="Subtotal for this line (unit_price * quantity)."
+    )
+
+
+class OrderResponse(BaseModel):
+    """One order row for GET /api/orders.
+
+    Field semantics mirror the ``create_order`` tool's payload (same
+    tables, same money conversion), so the orders table and the chat
+    answer can never disagree.
+    """
+
+    order_id: str = Field(..., description="Public order code (ORD-####).")
+    customer: OrderCustomerResponse | None = Field(
+        None, description="Customer info when available."
+    )
+    items: list[OrderItemResponse] = Field(
+        default_factory=list, description="Order lines with priced snapshots."
+    )
+    total_price: int | float = Field(..., description="Order total (IDR).")
+    status: str = Field(..., description="Order status (completed/refunded/cancelled).")
+    created_at: str = Field(
+        ..., description="Creation time (local, second precision, ISO 8601)."
+    )
+
+
+class OrderListResponse(BaseModel):
+    """Response payload for GET /api/orders (read-only)."""
+
+    orders: list[OrderResponse] = Field(
+        default_factory=list, description="Every order, newest first."
+    )
+    count: int = Field(..., description="Number of orders returned.")
+
+
+class ReportWindowResponse(BaseModel):
+    """One rolling sales window for GET /api/reports.
+
+    Field semantics mirror the ``get_sales_report`` tool exactly (same
+    ``sales_window`` aggregation, same completed-orders-only rule), so
+    the report cards and the chat answer can never disagree.
+    """
+
+    period: str = Field(..., description="Window name (daily/weekly/monthly).")
+    window_days: int = Field(..., description="Rolling window length in days.")
+    total_orders: int = Field(
+        ..., description="Completed orders in the window (refunded/cancelled excluded)."
+    )
+    total_items_sold: int = Field(..., description="Units sold in the window.")
+    total_revenue: int | float = Field(..., description="Revenue in the window (IDR).")
+    products_sold: dict[str, int] = Field(
+        default_factory=dict,
+        description="Units sold per product name, in order of first sale.",
+    )
+    top_product: str | None = Field(
+        None, description="Best-selling product in the window (first max), if any."
+    )
+
+
+class OrderStatusSummaryResponse(BaseModel):
+    """Order counts by status for GET /api/reports, as stored in the
+    database (no fixed status set is assumed)."""
+
+    by_status: dict[str, int] = Field(
+        default_factory=dict,
+        description="Order count for every status present in the table.",
+    )
+    total: int = Field(..., description="Orders overall, every status combined.")
+
+
+class ReportsResponse(BaseModel):
+    """Response payload for GET /api/reports (read-only)."""
+
+    generated_at: str = Field(
+        ..., description="When the report was computed (local, ISO 8601)."
+    )
+    status_summary: OrderStatusSummaryResponse = Field(
+        ..., description="Order counts by status, across all orders."
+    )
+    windows: list[ReportWindowResponse] = Field(
+        default_factory=list,
+        description="Daily, weekly, and monthly rolling sales windows.",
+    )
