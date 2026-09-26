@@ -116,6 +116,29 @@ class WhatsAppWebhookResponse(BaseModel):
     )
 
 
+class WhatsAppWebhookAck(BaseModel):
+    """Response payload for POST /webhook/whatsapp (real Meta payload).
+
+    Meta must receive a fast acknowledgement; the agent run and the
+    reply send happen in the background. No reply text, run ids, or
+    configuration details are exposed — just what the handler decided.
+    """
+
+    status: str = Field(
+        ...,
+        description=(
+            "accepted (processing scheduled), ignored (no text message in "
+            "the payload), or disabled (integration switched off)."
+        ),
+    )
+    new_messages: int = Field(
+        ..., description="Messages claimed for processing (duplicates excluded)."
+    )
+    duplicates: int = Field(
+        ..., description="Redelivered messages skipped by idempotency."
+    )
+
+
 class ApprovalResponse(BaseModel):
     """One approval record (human-in-the-loop, Step 8; Step 13: persistent; Step 16: execution)."""
 

@@ -2,13 +2,25 @@
 tool-calling agent loop, Step 4; local WhatsApp webhook simulator, Step 7;
 human-in-the-loop approval endpoints, Step 8; knowledge-base endpoints,
 Step 12; approvals persisted to PostgreSQL, Step 13; persistent agent
-memory endpoints, Step 14; deferred approval execution endpoint, Step 16)."""
+memory endpoints, Step 14; deferred approval execution endpoint, Step 16;
+real WhatsApp Cloud API webhook + verification handshake, Step 17)."""
 
+import json
 from dataclasses import asdict
 from datetime import datetime
+import secrets
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+)
 from fastapi.concurrency import run_in_threadpool
+from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.agent.agent import DibantuAgent
@@ -22,6 +34,11 @@ from app.approval.executor import (
 )
 from app.db import database, repository
 from app.db.models import money
+from app.whatsapp import service as whatsapp_service
+from app.whatsapp.client import WhatsAppCloudClient
+from app.whatsapp.config import WhatsAppConfig, get_whatsapp_config
+from app.whatsapp.signature import SIGNATURE_HEADER, is_valid_signature
+from app.whatsapp.schemas import MetaWebhookEvent
 from app.memory import (
     DEFAULT_OWNER_KEY,
     MemoryNotFoundError,
@@ -54,6 +71,7 @@ from app.models.schemas import (
     OrderStatusSummaryResponse,
     ReportWindowResponse,
     ReportsResponse,
+    WhatsAppWebhookAck,
     WhatsAppWebhookRequest,
     WhatsAppWebhookResponse,
 )
@@ -106,23 +124,148 @@ async def chat(
     return ChatResponse(response=result.reply, run_id=result.run_id)
 
 
+@router.get("/webhook/whatsapp", tags=["webhook"])
+async def verify_whatsapp_webhook(
+    hub_mode: str = Query("", alias="hub.mode"),
+    hub_verify_token: str = Query("", alias="hub.verify_token"),
+    hub_challenge: str = Query("", alias="hub.challenge"),
+) -> Response:
+    """Meta webhook verification handshake (Step 17).
+
+    When the integration is switched on in the Meta App dashboard, Meta
+    GETs this endpoint once with ``hub.mode=subscribe`` and the
+    ``WHATSAPP_VERIFY_TOKEN``; a constant-time token comparison decides
+    between echoing ``hub.challenge`` back (verification succeeds) and a
+    plain 403 (including while the integration is disabled). The
+    configured token itself is never echoed or exposed.
+    """
+    config = get_whatsapp_config()
+    token_matches = config.enabled and config.can_verify() and secrets.compare_digest(
+        hub_verify_token.encode("utf-8"), config.verify_token.encode("utf-8")
+    )
+    if hub_mode != "subscribe" or not token_matches:
+        raise HTTPException(status_code=403, detail="Webhook verification failed.")
+    return Response(content=hub_challenge, media_type="text/plain")
+
+
+def _build_cloud_client(config: WhatsAppConfig) -> WhatsAppCloudClient | None:
+    """Build the Graph API send client, or None when not configured.
+
+    A module-level seam so tests can substitute a client answered by an
+    ``httpx.MockTransport``; returning None routes every claimed message
+    to the contained "reply could not be sent" failure path.
+    """
+    if not config.enabled or not config.can_send():
+        return None
+    return WhatsAppCloudClient(config)
+
+
 @router.post(
     "/webhook/whatsapp",
-    response_model=WhatsAppWebhookResponse,
+    response_model=WhatsAppWebhookAck | WhatsAppWebhookResponse,
     tags=["webhook"],
 )
 async def whatsapp_webhook(
-    request: WhatsAppWebhookRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
     agent: DibantuAgent = Depends(get_agent),
-) -> WhatsAppWebhookResponse:
-    """Simulated WhatsApp webhook (Step 7): answer a WhatsApp-style message.
+) -> WhatsAppWebhookAck | WhatsAppWebhookResponse:
+    """WhatsApp webhook: the real Meta Cloud API flow and the local simulator.
 
-    Simulator only -- no Meta verification or signature check yet. The
-    message goes through the same tool-calling agent dependency as
-    /api/chat (tool failures stay visible to the agent instead of
-    crashing the webhook), and the reply is addressed back to the
-    sender's number.
+    The two share this endpoint and are told apart by their payloads:
+    a Meta envelope (``object`` + ``entry``, Step 17) is authenticated
+    against the ``X-Hub-Signature-256`` header (HMAC-SHA256 over the
+    RAW request body with the App Secret — enforced whenever
+    ``WHATSAPP_APP_SECRET`` is configured), parsed, its message ids
+    claimed for exactly-once processing, and acknowledged immediately —
+    the agent run and the WhatsApp reply happen in the background so
+    Meta never waits on the LLM. Anything else is the Step 7 simulator
+    (``{"from": ..., "message": ...}``): the same tool-calling agent
+    dependency as /api/chat answers synchronously, with the reply
+    addressed back to the sender's number (tool failures stay visible
+    to the agent instead of crashing the webhook; no signature is
+    expected or checked on the simulator path).
     """
+    raw_body = await request.body()
+    payload = _parse_json_body(raw_body)
+    if isinstance(payload, dict) and "object" in payload and "entry" in payload:
+        return await _handle_cloud_webhook(
+            payload, raw_body, request, background_tasks, agent
+        )
+    return await _handle_simulated_webhook(payload, agent)
+
+
+def _parse_json_body(raw_body: bytes) -> object:
+    """The raw request body parsed as JSON; 422 when it is not valid JSON."""
+    try:
+        return json.loads(raw_body)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=422, detail="Request body is not valid JSON."
+        ) from exc
+
+
+async def _handle_cloud_webhook(
+    payload: dict,
+    raw_body: bytes,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    agent: DibantuAgent,
+) -> WhatsAppWebhookAck:
+    """Claim, acknowledge, and schedule the real Meta webhook messages."""
+    config = get_whatsapp_config()
+    if config.enabled and config.can_validate_signature():
+        header = request.headers.get(SIGNATURE_HEADER)
+        if not is_valid_signature(raw_body, header, config.app_secret):
+            # Authenticated rejection BEFORE any parse, claim, or agent
+            # run — and before echoing anything about the configuration.
+            raise HTTPException(
+                status_code=403, detail="Webhook signature validation failed."
+            )
+    try:
+        event = MetaWebhookEvent.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422, detail=exc.errors(include_url=False)
+        ) from exc
+    client = _build_cloud_client(config)
+    try:
+        outcome = await whatsapp_service.handle_meta_webhook(
+            event,
+            config=config,
+            agent=agent,
+            client=client,
+            background_tasks=background_tasks,
+        )
+    except SQLAlchemyError as exc:
+        # Without the idempotency ledger exactly-once processing cannot
+        # be guaranteed; a 503 asks Meta to redeliver rather than risk
+        # executing an order twice.
+        raise HTTPException(
+            status_code=503,
+            detail="WhatsApp webhook store is unavailable (database error).",
+        ) from exc
+    if client is not None:
+        # BackgroundTasks run in order, so the client outlives every
+        # scheduled send and is released right after the last one.
+        background_tasks.add_task(client.aclose)
+    return WhatsAppWebhookAck(
+        status=outcome.status,
+        new_messages=outcome.new_messages,
+        duplicates=outcome.duplicates,
+    )
+
+
+async def _handle_simulated_webhook(
+    payload: object, agent: DibantuAgent
+) -> WhatsAppWebhookResponse:
+    """The original Step 7 simulator flow, unchanged."""
+    try:
+        request = WhatsAppWebhookRequest.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422, detail=exc.errors(include_url=False)
+        ) from exc
     if not agent.is_configured():
         raise HTTPException(
             status_code=503, detail="GLM_API_KEY is not configured."

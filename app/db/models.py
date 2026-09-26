@@ -238,6 +238,31 @@ class AgentEventRecord(Base):
     error_type: Mapped[str | None] = mapped_column(String(100))
 
 
+class WhatsAppEventRecord(Base):
+    """Idempotency ledger for real WhatsApp Cloud API webhooks (Step 17).
+
+    Meta may deliver the same webhook event more than once; the unique
+    ``message_id`` (the wamid of the incoming message) is claimed with
+    an atomic INSERT ... ON CONFLICT DO NOTHING BEFORE the agent runs,
+    so a duplicate delivery can never create a second order or send a
+    second reply — across requests, workers, and restarts. ``status``
+    tracks what happened after the claim (received → processed/failed).
+    """
+
+    __tablename__ = "whatsapp_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    message_id: Mapped[str] = mapped_column(
+        String(128), nullable=False, unique=True
+    )
+    sender_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(nullable=False)
+    processed_at: Mapped[datetime | None] = mapped_column()
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="received", index=True
+    )
+
+
 def money(value: Decimal) -> int | float:
     """Convert a Numeric money value to a JSON-friendly number.
 

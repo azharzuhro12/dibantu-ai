@@ -21,9 +21,10 @@ Masalah yang dipecahkan: pemilik usaha kecil tidak butuh aplikasi kasir kompleks
 13. [Human-in-the-Loop Approval Execution (Step 16)](#human-in-the-loop-approval-execution-step-16)
 14. [Agent Memory (Step 14)](#agent-memory-step-14)
 15. [Observability (Step 15)](#observability-step-15)
-16. [Testing & Evaluation](#testing--evaluation)
-17. [Struktur Project](#struktur-project)
-18. [Status & Limitations](#status--limitations)
+16. [WhatsApp Cloud API (Step 17)](#whatsapp-cloud-api-step-17)
+17. [Testing & Evaluation](#testing--evaluation)
+18. [Struktur Project](#struktur-project)
+19. [Status & Limitations](#status--limitations)
 
 ## Fitur Utama
 
@@ -33,7 +34,7 @@ Masalah yang dipecahkan: pemilik usaha kecil tidak butuh aplikasi kasir kompleks
 - **Human-in-the-loop approval (Step 8 → 16)** — aksi sensitif (refund, cancel order, bulk stock update) tidak pernah dieksekusi agent; ia membuat approval persisten, manusia memutuskan, lalu **eksekusi eksplisit** menjalankan aksi tepat sekali dari snapshot payload immutable (allowlist executor, claim atomik di database).
 - **Agent memory persisten (Step 14)** — fakta eksplisit (preferensi, konteks customer/bisnis, instruksi) tersimpan per owner di PostgreSQL dan di-inject sebagai konteks kecil di prompt; ada layar rahasia dan isolasi antar owner.
 - **Observability (Step 15)** — setiap eksekusi agent ditrace end-to-end di PostgreSQL (LLM, tool, memory, RAG, approval) dengan satu `run_id` stabil yang dikembalikan ke pemanggil; metadata aman by construction (tanpa prompt/respon/rahasia).
-- **WhatsApp webhook simulator** — endpoint webhook ber-format WhatsApp untuk pengujian lokal (bukan integrasi Meta sungguhan).
+- **WhatsApp: simulator + Cloud API sungguhan (Step 17)** — satu endpoint webhook melayani dua arah: payload simulator lokal untuk test deterministik, dan envelope Meta WhatsApp Cloud API sungguhan (klaim idempoten `wamid` di PostgreSQL sebelum agent jalan, ack cepat, reply dikirim via Graph API dengan format WhatsApp + chunking 4096 karakter). Nonaktif secara default (`WHATSAPP_ENABLED=false`).
 - **Dashboard Next.js** — halaman chat, inventory, orders, reports, approvals, memory, dan observability.
 - **Evaluation suite deterministik** — 52 skenario offline yang memverifikasi tool selection, task completion, error handling, dan grounding jawaban (34 bisnis + 4 RAG + 4 memori + 8 approval + 2 observability).
 
@@ -174,6 +175,13 @@ Semua alur di atas juga tersedia dari halaman **Approvals** di frontend (approve
 | `RAG_EMBEDDINGS` | Tidak | `local` (sentence-transformers, default) atau `hashing` (deterministik offline — untuk test/eval). |
 | `RAG_EMBEDDING_MODEL` | Tidak | Default: `sentence-transformers/all-MiniLM-L6-v2`. |
 | `RAG_TOP_K` | Tidak | Jumlah passage per query. Default: `3`. |
+| `WHATSAPP_ENABLED` | Tidak | `true` untuk mengaktifkan webhook Cloud API sungguhan. Default: `false` (simulator lokal selalu aktif). |
+| `WHATSAPP_VERIFY_TOKEN` | Tidak | Token verifikasi handshake GET webhook (string buatan sendiri, sama dengan yang diisi di dashboard Meta). |
+| `WHATSAPP_ACCESS_TOKEN` | Tidak | System User access token Meta untuk mengirim reply via Graph API. |
+| `WHATSAPP_PHONE_NUMBER_ID` | Tidak | Phone number id dari dashboard Meta (WhatsApp → API Setup). |
+| `WHATSAPP_APP_SECRET` | Tidak | App Secret (App Settings → Basic). Bila diisi, setiap POST webhook Meta **wajib** membawa `X-Hub-Signature-256` valid (HMAC-SHA256 raw body) — ditolak 403 bila tidak. Kosong (default) = validasi signature nonaktif. |
+| `WHATSAPP_API_VERSION` | Tidak | Versi Graph API. Default: `v25.0`. |
+| `WHATSAPP_TIMEOUT_SECONDS` | Tidak | Timeout tiap call Graph API. Default: `15`. |
 
 > **Keamanan:** jangan pernah menulis API key asli ke file yang di-commit. Gunakan `.env` (di-ignore `.gitignore` dan `.dockerignore`).
 
@@ -185,7 +193,10 @@ Semua alur di atas juga tersedia dari halaman **Approvals** di frontend (approve
 | GET | `/docs` | Swagger UI (OpenAPI). |
 | POST | `/api/chat` | Chat dengan agent (tool calling; `owner_key` opsional di body untuk memori per-owner, default `"default"`). |
 | GET | `/api/inventory` | Daftar semua produk read-only (nama, harga, stok, status stok) — sumber data sama dengan tool `check_stock`; tanpa LLM. |
-| POST | `/webhook/whatsapp` | Simulator webhook WhatsApp (lokal, tanpa Meta). |
+| GET | `/api/orders` | Daftar pesanan read-only (customer, item, total, status), terbaru dulu. |
+| GET | `/api/reports` | Ringkasan penjualan read-only (per status + window harian/mingguan/bulanan, completed-only) — agregasi yang sama dengan tool `get_sales_report`. |
+| GET | `/webhook/whatsapp` | **(Step 17)** Handshake verifikasi webhook Meta (`hub.mode`/`hub.verify_token`/`hub.challenge`; perbandingan token constant-time; 403 saat nonaktif). |
+| POST | `/webhook/whatsapp` | Webhook WhatsApp: envelope Meta Cloud API **(Step 17** — klaim idempoten, ack langsung, reply via Graph API di background**)** atau payload simulator lokal Step 7 (dibedakan dari bentuk payload). |
 | GET | `/api/approvals` | Daftar approval (default: pending; `?status=approved\|rejected\|executing\|executed\|failed\|all` untuk lifecycle penuh). |
 | POST | `/api/approvals/{id}/approve` | Setujui approval (opsional `?reason=...`, maks 500 karakter) — hanya mencatat keputusan. |
 | POST | `/api/approvals/{id}/reject` | Tolak approval (opsional `?reason=...`, tercatat sebagai `decision_reason`) — terminal, tidak bisa dieksekusi. |
@@ -201,7 +212,7 @@ Semua alur di atas juga tersedia dari halaman **Approvals** di frontend (approve
 
 ## Database
 
-Skema (migration `alembic/versions/0001`): `products`, `customers`, `orders`, `order_items` — uang memakai `Numeric(12,2)` (bukan float), FK + index lengkap, nama produk/customer unik case-insensitive. Migration `0002` menambah tabel `approvals` (lihat [Approval Persisten](#approval-persisten-step-13)), `0003` tabel `agent_memories` ([Agent Memory](#agent-memory-step-14)), `0004` tabel `agent_runs` + `agent_events` ([Observability](#observability-step-15)), dan `0005` kolom eksekusi approval + `orders.refunded_amount` ([Approval Execution](#human-in-the-loop-approval-execution-step-16)).
+Skema (migration `alembic/versions/0001`): `products`, `customers`, `orders`, `order_items` — uang memakai `Numeric(12,2)` (bukan float), FK + index lengkap, nama produk/customer unik case-insensitive. Migration `0002` menambah tabel `approvals` (lihat [Approval Persisten](#approval-persisten-step-13)), `0003` tabel `agent_memories` ([Agent Memory](#agent-memory-step-14)), `0004` tabel `agent_runs` + `agent_events` ([Observability](#observability-step-15)), `0005` kolom eksekusi approval + `orders.refunded_amount` ([Approval Execution](#human-in-the-loop-approval-execution-step-16)), dan `0006` tabel `whatsapp_events` ([WhatsApp Cloud API](#whatsapp-cloud-api-step-17)).
 
 ```bash
 # inspeksi database
@@ -354,12 +365,46 @@ Setiap eksekusi agent ditrace **end-to-end** di dua tabel PostgreSQL (migration 
 
 **Batasan:** tracing level operasi (bukan baris-per-baris audit log); belum ada agregat/metric (mis. token per hari); retention/retensi data run belum diatur (tabel tumbuh sampai dibersihkan manual); endpoint observability belum memakai autentikasi; dan bila penyimpanan run gagal total (DB down), response tetap membawa `run_id` yang tak pernah tersimpan — pencarian run tersebut akan 404 (temuan audit final, follow-up).
 
+## WhatsApp Cloud API (Step 17)
+
+Integrasi webhook Meta WhatsApp Cloud API **sungguhan**, berbagi satu endpoint dengan simulator lokal dan dibedakan dari bentuk payload-nya (envelope Meta selalu punya `object` + `entry`; simulator `{"from": ..., "message": ...}`). **Nonaktif secara default** (`WHATSAPP_ENABLED=false`) — sampai diaktifkan sengaja, aplikasi berperilaku persis seperti sebelumnya.
+
+```
+Meta POST /webhook/whatsapp (envelope + header X-Hub-Signature-256)
+  → verifikasi signature: HMAC-SHA256 atas RAW body dengan App Secret,
+    perbandingan constant-time — 403 sebelum apa pun diproses (saat
+    WHATSAPP_APP_SECRET terkonfigurasi)
+  → parse: hanya pesan teks; status delivery & tipe lain diabaikan
+  → klaim tiap wamid di PostgreSQL (INSERT ... ON CONFLICT DO NOTHING
+    → RETURNING) SEBELUM agent jalan — redelivery Meta tidak pernah
+    menjalankan agent dua kali
+  → ack 200 segera (Meta tidak boleh menunggu LLM)
+  → background: DibantuAgent (owner = wa_id pengirim, source =
+    webhook_whatsapp_cloud — memori/tools/RAG/approval/trace sama
+    persis dengan /api/chat)
+    → reply diformat untuk WhatsApp (tabel → "Header: nilai", ** → *,
+      chunk ≤ 4096 karakter, lossless)
+    → kirim via POST graph.facebook.com/{VERSI}/{PHONE_NUMBER_ID}/messages
+```
+
+**Exactly-once by construction:** klaim idempoten hidup di database (bukan memori), jadi dedup bertahan restart dan berlaku lintas worker. Tanpa ledger (DB down) endpoint menjawab 503 supaya Meta mengirim ulang, bukan menerima risiko eksekusi order dua kali. Kegagalan setelah klaim (agent error / gagal kirim) ditandai `failed` di ledger — tidak pernah diulang otomatis; `failed` terminal, pesan yang sama dikirim ulang user akan jadi wamid baru.
+
+**Keamanan:**
+
+- Token akses hanya hidup di header `Authorization`, tidak pernah di-log, tidak pernah masuk pesan error (error hanya membawa status HTTP + pesan business-level Meta, ≤ 300 karakter).
+- Verifikasi handshake GET memakai perbandingan constant-time (`secrets.compare_digest`); token terkonfigurasi tidak pernah di-echo.
+- **Validasi `X-Hub-Signature-256` sesuai dokumentasi Meta**: HMAC-SHA256 atas **raw request body byte demi byte** (bukan JSON re-serialisasi — payload yang sama dengan whitespace berbeda tetap ditolak) dengan App Secret sebagai key; perbandingan constant-time (`hmac.compare_digest`); header hilang/malformed/tanpa prefix `sha256=`/algoritma salah semuanya 403. Ditegakkan hanya bila `WHATSAPP_APP_SECRET` terisi dan integrasi aktif — simulator lokal tidak pernah diminta signature.
+- Endpoint menolak payload struktural sampah dengan 422 tanpa menyentuh agent.
+- Aksi sensitif dari WhatsApp tetap lewat approval — tidak ada yang dieksekusi otomatis dari pesan masuk.
+
+**Batasan (terdokumentasi, belum diimplementasikan):** tidak ada validasi bahwa `phone_number_id` pada envelope milik kita; untuk pengembangan lokal perlu tunnel (mis. ngrok) agar Meta bisa mencapai webhook; pesan non-teks (gambar/audio/tombol) diabaikan; dan jendela layanan 24 jam Meta (biaya template di luar jendela) adalah kebijakan platform di luar kendali kode. Pilihan desain (bukan spesifikasi Meta): penolakan signature memakai 403, dan validasi hanya wajib saat App Secret terkonfigurasi + integrasi aktif (integrasi nonaktif tetap menjawab ack `disabled` agar Meta tidak retry-loop).
+
 ## Testing & Evaluation
 
 ```bash
 docker compose up -d postgres   # test database butuh Postgres
 source .venv/bin/activate
-pytest -q                       # 350 test (349 lulus + 1 skip kondisional)
+pytest -q                       # 409 test (408 lulus + 1 skip kondisional)
 python -m evaluation.evaluator  # 52 skenario
 ```
 
@@ -380,6 +425,7 @@ dibantu-ai/
 │   ├── models/         # Schema Pydantic
 │   ├── observability/  # Tracing run/event: manager, repository (Step 15)
 │   ├── rag/            # RAG: chunker, embeddings, vector store, retriever, service, tool, CLI
+│   ├── whatsapp/       # Cloud API: config, client Graph, parser, ledger, service (Step 17)
 │   └── tools/          # Business tools + registry + sensitive actions (Step 16)
 ├── alembic/            # Migration database
 ├── data/
@@ -388,14 +434,14 @@ dibantu-ai/
 ├── docker/             # entrypoint.sh (migrate + seed + uvicorn)
 ├── evaluation/         # Dataset + evaluator deterministik
 ├── frontend/           # Dashboard Next.js
-├── tests/              # 350 test pytest (1 skip kondisional)
+├── tests/              # 409 test pytest (1 skip kondisional)
 ├── docker-compose.yml
 └── Dockerfile
 ```
 
 ## Status & Limitations
 
-✅ **Step 1–16 selesai dan ter-audit** — 349 test lulus (+1 skip kondisional), evaluasi 52/52, lint+build frontend bersih, Docker healthy, migration `0005` applied, alur approval→execute terverifikasi live (termasuk uji race konkurensi sungguhan via `threading.Barrier`).
+✅ **Step 1–17 selesai dan ter-audit** — 408 test lulus (+1 skip kondisional), evaluasi 52/52, lint+build frontend bersih, Docker healthy, migration `0006` applied, alur approval→execute terverifikasi live (termasuk uji race konkurensi sungguhan via `threading.Barrier`).
 
 | Step | Deliverable |
 | --- | --- |
@@ -411,7 +457,8 @@ dibantu-ai/
 | 14 | Agent memory persisten per owner (layar rahasia, isolasi) |
 | 15 | Observability end-to-end (`run_id` stabil, metadata aman by construction) |
 | 16 | Deferred approval execution (allowlist executor, claim atomik, idempoten, refund penuh/parsial) |
+| 17 | WhatsApp Cloud API sungguhan (webhook Meta + handshake, ledger idempoten, reply via Graph API) |
 
-Belum diimplementasikan (backlog yang disengaja): WhatsApp Cloud API sungguhan (Meta auth + verifikasi signature), tunnel ngrok, integrasi Google Sheets, autentikasi, dan deployment. Endpoint orders/reports khusus belum ada — halaman frontend terkait masih lewat assistant (inventory sudah punya endpoint read-only sendiri).
+Belum diimplementasikan (backlog yang disengaja): tunnel ngrok, integrasi Google Sheets, autentikasi, dan deployment. Ketiga dashboard (inventory/orders/reports) sudah punya endpoint read-only sendiri.
 
 Limitasi per fitur (jujur dan lengkap) didokumentasikan di masing-masing section di atas. Limitasi RAG: tidak ada UI manajemen dokumen (tambah/ubah dokumen = edit file + re-ingest); dokumen yang dihapus dari `data/knowledge/` tidak otomatis menghapus chunk lama di store (re-ingest dokumen berubah sudah ditangani); belum ada re-ranking maupun filter similarity threshold (relevansi dinilai GLM dari passage yang kembali); embedding model default berbahasa Inggris — dokumen Indonesia tetap ter-retrieve dengan baik lewat overlap kosakata, tapi model multibahasa (mis. `paraphrase-multilingual-MiniLM`) bisa lebih akurat dan tinggal ganti `RAG_EMBEDDING_MODEL` + hapus `data/rag/` + re-ingest.
